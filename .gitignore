@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Model checkpoints & outputs (large binaries)
+outputs/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Data directory (large CSVs / raw datasets)
+data/
+*.csv
+!results/**/*.csv
+
+# Logs & temp files
+*.log
+.cache/
+wandb/
+
+# OS / Editor files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,2 @@
+train_runtime,train_samples_per_second,train_steps_per_second,total_flos,train_loss,epoch,eval_loss,eval_macro_f1,eval_macro_precision,eval_macro_recall,eval_accuracy,eval_runtime,eval_samples_per_second,eval_steps_per_second
+38.1785,2.593,0.105,591536487168.0,1.921721339225769,1.0,1.0985445976257324,0.16666666666666666,0.1111111111111111,0.3333333333333333,0.3333333333333333,9.1421,10.829,0.438

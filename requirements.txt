@@ -1,0 +1,41 @@
+# ============================================================
+# Requirements for:
+#   Fine-tuning Small Language Models for
+#   Multilingual Sentiment Analysis (Marathi / Code-mixed)
+# ============================================================
+
+# ------------------------------------------------------------------
+# PyTorch — Install CUDA-enabled build FIRST (before this file).
+# Do NOT use `pip install torch` from this file for CUDA support.
+#
+# For CUDA 12.x (RTX 5060 / Blackwell arch, PyTorch >= 2.4):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+# Verify GPU is visible after install:
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# ------------------------------------------------------------------
+
+# Core ML / NLP
+transformers>=4.40.0
+datasets>=2.18.0
+evaluate>=0.4.1
+accelerate>=0.29.0          # Required by Hugging Face Trainer for mixed-precision
+tokenizers>=0.19.0
+
+# Classical ML baseline
+scikit-learn>=1.4.2
+scipy>=1.13.0
+
+# Data handling
+pandas>=2.2.2
+numpy>=1.26.4
+
+# Visualisation
+matplotlib>=3.8.4
+seaborn>=0.13.2
+
+# Utilities
+tqdm>=4.66.2
+sentencepiece>=0.2.0        # Required by indic-bert / MuRIL tokenisers
+protobuf>=4.25.3            # Required by sentencepiece
+huggingface-hub>=0.22.2
