@@ -1,0 +1,31 @@
+text,gold,predicted,correct,confidence,latency_ms
+"khup chan movie aahe, must watch!",positive,positive,True,0.6968,398.05
+"aaj khup chand din gela, totally loved it",positive,positive,True,0.9848,20.53
+he gaane ekdum best aahe yaar,positive,positive,True,0.9684,18.47
+actor cha performance ekdum top class aahe,positive,positive,True,0.6179,18.97
+"majha favorite show ahe, best episode ever!",positive,positive,True,0.9919,22.32
+"bahut accha aahe bhai, truly amazing story",positive,positive,True,0.9817,18.2
+"this product is genuinely khup chan, 5 stars!",positive,positive,True,0.8985,18.71
+"game khup addictive aahe, non stop khelto me",positive,positive,True,0.4612,37.29
+"teacher ne khup chan samjavle, really helpful",positive,positive,True,0.9904,15.58
+"mala khup aanand jhala, best day of my life",positive,positive,True,0.9079,15.4
+"thik aahe, na too good na too bad",neutral,negative,False,0.8389,20.14
+"movie average aahe, time pass chhan ahe",neutral,neutral,True,0.8151,19.43
+"product okay aahe, as expected",neutral,positive,False,0.508,17.82
+"majha opinion different aahe, each to their own",neutral,positive,False,0.6159,14.19
+"TBH mala mahit nahi, idk about this",neutral,negative,False,0.4745,16.93
+"normal aahe, nothing special about it",neutral,positive,False,0.7999,17.2
+"he news just for information aahe, no views",neutral,neutral,True,0.7065,16.21
+"situation thodi complicated aahe, will see",neutral,neutral,True,0.8468,16.1
+"mixed feelings aahet, can't decide",neutral,neutral,True,0.6596,16.57
+"aaj weather thik aahe, neither hot nor cold",neutral,neutral,True,0.8539,14.5
+"khup boring movie aahe, waste of time",negative,neutral,False,0.8834,18.68
+"he product ekdum bakwaas aahe, don't buy",negative,neutral,False,0.8757,23.07
+"service khup poori aahe, very disappointed",negative,positive,False,0.472,19.73
+"mala khup raga ala, worst experience ever",negative,neutral,False,0.5222,15.33
+"actor cha performance terrible aahe yaar, LOL no",negative,neutral,False,0.7774,21.92
+"bahut bura laga, really hurt ho gaya",negative,negative,True,0.4526,20.41
+"he gaana mala bilkul avdla nahi, waste",negative,neutral,False,0.5079,12.3
+"traffic khup jam aahe, irritating day",negative,negative,True,0.6154,15.67
+"exam khup tough hota, failed re",negative,negative,True,0.8605,14.66
+"he restaurant cha food ekdum kharab aahe, never again",negative,negative,True,0.6284,19.79

@@ -39,3 +39,5 @@ tqdm>=4.66.2
 sentencepiece>=0.2.0        # Required by indic-bert / MuRIL tokenisers
 protobuf>=4.25.3            # Required by sentencepiece
 huggingface-hub>=0.22.2
+
+streamlit>=1.35.0
