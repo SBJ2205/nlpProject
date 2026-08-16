@@ -21,6 +21,7 @@ python src/data_loader.py --data_dir data/ --debug
 import argparse
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -59,13 +60,62 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Text normalisation  (Objective 2)
+# ---------------------------------------------------------------------------
+
+# Zero-width and invisible Unicode characters common in social-media / OCR text
+_ZW_CHARS = re.compile(
+    r"[\u200b\u200c\u200d\u200e\u200f\u00ad\ufeff\u2060\u2061\u2062\u2063]"
+)
+# URLs (http / https / www)
+_URL_PAT = re.compile(
+    r"https?://\S+|www\.\S+",
+    flags=re.IGNORECASE,
+)
+# HTML entities and tags
+_HTML_PAT = re.compile(r"<[^>]+>|&[a-z]+;")
+# Runs of whitespace (tabs, newlines, multiple spaces) → single space
+_WS_PAT = re.compile(r"[\t\n\r]+|[ ]{2,}")
+
+
+def normalize_text(text: str) -> str:
+    """
+    Lightweight text normaliser for Marathi / code-mixed social-media text.
+
+    Steps (Objective 2 of the project proposal):
+      1. Remove URLs (http/https/www)
+      2. Remove HTML tags and entities
+      3. Strip zero-width and invisible Unicode characters
+      4. Collapse runs of whitespace into a single space
+      5. Strip leading / trailing whitespace
+
+    Devanagari script and Unicode punctuation are intentionally preserved so
+    that subword tokenisers (SentencePiece / WordPiece) can process them.
+
+    Parameters
+    ----------
+    text : str
+
+    Returns
+    -------
+    str  — normalised text
+    """
+    text = _URL_PAT.sub(" ", text)
+    text = _HTML_PAT.sub(" ", text)
+    text = _ZW_CHARS.sub("", text)
+    text = _WS_PAT.sub(" ", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # CSV helpers
 # ---------------------------------------------------------------------------
 
 def _load_csv(path: Path) -> pd.DataFrame:
-    """Read one split CSV and return a clean two-column DataFrame."""
+    """Read one split CSV and return a clean, normalised two-column DataFrame."""
     df = pd.read_csv(path, usecols=["text", "label"])
-    df["text"] = df["text"].fillna("").astype(str).str.strip()
+    # Apply text normalisation (Objective 2: strip URLs, zero-width chars, etc.)
+    df["text"] = df["text"].fillna("").astype(str).apply(normalize_text)
     df["label"] = df["label"].map(LABEL_MAP)
     df = df.dropna(subset=["label"])
     df["label"] = df["label"].astype(int)

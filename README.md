@@ -23,18 +23,23 @@ dataset for sentiment classification of Marathi and code-mixed text.
 
 ```
 NLP/
+├── app.py                 # Streamlit interactive web dashboard
 ├── requirements.txt
 ├── README.md
 ├── src/
-│   ├── data_loader.py     # Dataset loading & tokenisation
+│   ├── data_loader.py     # Dataset loading, normalization & tokenisation
 │   ├── baseline.py        # TF-IDF + Logistic Regression baseline
 │   ├── train.py           # Hugging Face Trainer fine-tuning
-│   ├── evaluate.py        # Metrics + confusion matrix plots
-│   └── domain_eval.py     # Cross-domain evaluation (4 L3Cube sub-datasets)
-├── outputs/               # Created automatically during training
-│   └── indic-bert-marathi-sentiment/
-└── results/               # Metrics CSVs, confusion matrices & domain plots
-    └── domain_eval/       # Per-domain CSVs, bar chart & latency chart
+│   ├── evaluate.py        # Metrics + confusion matrix plots + latency
+│   ├── domain_eval.py     # Cross-domain evaluation (4 L3Cube sub-datasets)
+│   ├── predict.py         # Real-time CLI sentiment inference
+│   └── code_mixed_eval.py # 30-sentence code-mixed test set evaluation
+├── outputs/               # Saved model checkpoints (gitignored)
+│   ├── ai4bharat--indic-bert/
+│   └── google--muril-base-cased/
+└── results/               # Metrics CSVs, confusion matrices, loss curves & plots
+    ├── domain_eval/       # Per-domain CSVs, bar chart & latency chart
+    └── code_mixed_eval/   # Code-mixed CSVs & confusion matrix
 ```
 
 ---

@@ -21,6 +21,7 @@ python src/evaluate.py --data_dir data/ --model_dir outputs/ai4bharat--indic-ber
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -78,6 +79,10 @@ def get_predictions(
     model.to(device)
     model.eval()
 
+    # Log model size (Objective 11)
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info("Model size: %s parameters (%.1f M)", f"{n_params:,}", n_params / 1e6)
+
     raw_ds   = load_raw_dataset(debug=debug, data_dir=data_dir)
     eval_key = "validation" if "validation" in raw_ds else "test"
     eval_data = raw_ds[eval_key]
@@ -93,6 +98,7 @@ def get_predictions(
     log.info("Running inference on %d samples …", len(texts))
     BATCH = 64
     all_preds: list[int] = []
+    total_time: float = 0.0
 
     for i in range(0, len(texts), BATCH):
         batch = texts[i : i + BATCH]
@@ -102,13 +108,17 @@ def get_predictions(
         )
         enc = {k: v.to(device) for k, v in enc.items()}
         with torch.no_grad():
+            t0 = time.perf_counter()
             logits = model(**enc).logits
+            total_time += time.perf_counter() - t0
         all_preds.extend(torch.argmax(logits, dim=-1).cpu().numpy().tolist())
 
         if (i // BATCH) % 5 == 0:
             log.info("  %d / %d done", min(i + BATCH, len(texts)), len(texts))
 
-    return y_true, np.array(all_preds, dtype=np.int64), label_names
+    ms_per_sample = (total_time / len(texts)) * 1000 if texts else 0.0
+    log.info("Inference latency: %.2f ms / sample", ms_per_sample)
+    return y_true, np.array(all_preds, dtype=np.int64), label_names, ms_per_sample
 
 
 # ---------------------------------------------------------------------------
@@ -224,10 +234,19 @@ def run_evaluation(
         Path to local CSV directory; falls back to HuggingFace Hub if None.
     """
     device = detect_device(force_cpu=force_cpu)
-    y_true, y_pred, label_names = get_predictions(
+    y_true, y_pred, label_names, ms_per_sample = get_predictions(
         model_dir=model_dir, debug=debug, device=device, data_dir=data_dir
     )
     compute_and_log_metrics(y_true, y_pred, label_names, model_dir)
+    # Append latency to the summary CSV
+    tag = Path(model_dir).name
+    import pandas as pd
+    csv_path = RESULTS_DIR / f"{tag}_eval_summary.csv"
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        df["ms_per_sample"] = round(ms_per_sample, 3)
+        df.to_csv(csv_path, index=False)
+    log.info("Inference latency: %.2f ms / sample (appended to summary CSV)", ms_per_sample)
     plot_confusion_matrix(y_true, y_pred, label_names, model_dir)
     log.info("Evaluation complete. Results in '%s/'", RESULTS_DIR)
 

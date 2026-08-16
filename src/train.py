@@ -23,6 +23,7 @@ import logging
 import sys
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from transformers import (
@@ -50,6 +51,60 @@ log = logging.getLogger(__name__)
 DEFAULT_MODEL: str = "google/muril-base-cased"   # public, no login needed
 RESULTS_DIR: str = "results"
 SEED: int = 42
+
+
+# ---------------------------------------------------------------------------
+# Loss curve plotting  (Objectives 10 & 11)
+# ---------------------------------------------------------------------------
+
+def plot_loss_curves(log_history: list[dict], output_dir: str, model_slug: str) -> None:
+    """
+    Save a training / validation loss curve PNG from the Trainer log history.
+
+    Parameters
+    ----------
+    log_history : list[dict]
+        ``trainer.state.log_history`` after training.
+    output_dir : str
+        Base output directory — plot saved to ``results/``.
+    model_slug : str
+        Used as part of the filename, e.g. ``ai4bharat--indic-bert``.
+    """
+    train_steps, train_losses = [], []
+    eval_steps,  eval_losses  = [], []
+
+    for entry in log_history:
+        if "loss" in entry and "eval_loss" not in entry:
+            train_steps.append(entry.get("step", 0))
+            train_losses.append(entry["loss"])
+        if "eval_loss" in entry:
+            eval_steps.append(entry.get("step", 0))
+            eval_losses.append(entry["eval_loss"])
+
+    if not train_losses:
+        log.warning("No loss history found — skipping loss curve plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(train_steps, train_losses, label="Training Loss",   color="#2196F3", linewidth=2)
+    if eval_losses:
+        ax.plot(eval_steps, eval_losses, label="Validation Loss", color="#FF5722",
+                linewidth=2, linestyle="--", marker="o", markersize=5)
+
+    ax.set_xlabel("Training Step", fontsize=12)
+    ax.set_ylabel("Loss",          fontsize=12)
+    ax.set_title(f"Training & Validation Loss — {model_slug}",
+                 fontsize=13, fontweight="bold")
+    ax.legend(fontsize=11)
+    ax.grid(alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    out = Path(RESULTS_DIR) / f"{model_slug}_loss_curves.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info("Loss curves saved → %s", out)
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +270,12 @@ def train(
     )
     model.to(device)
 
+    # Log model size (Objective 11)
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info("Model size  : %s parameters (%.1f M total, %.1f M trainable)",
+             f"{n_params:,}", n_params / 1e6, n_trainable / 1e6)
+
     # 4. Output path — derived from model name so different models never collide
     model_slug = model_name.replace("/", "--")
     output_dir = (
@@ -257,6 +318,10 @@ def train(
         Path(RESULTS_DIR) / "train_metrics.csv", index=False
     )
     log.info("Training summary → %s/train_metrics.csv", RESULTS_DIR)
+
+    # 9. Plot loss curves (Objective 10)
+    model_slug = model_name.replace("/", "--")
+    plot_loss_curves(trainer.state.log_history, output_dir, model_slug)
 
 
 # ---------------------------------------------------------------------------
