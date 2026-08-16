@@ -17,6 +17,51 @@ dataset for sentiment classification of Marathi and code-mixed text.
 | **Dataset** | `l3cube-pune/marathi-sentiment-md` (HuggingFace Hub) |
 | **Target GPU** | NVIDIA RTX 5060 — 8 GB VRAM |
 
+
+---
+
+## 📊 Results
+
+All models fine-tuned on the L3Cube-MahaSent-MD dataset (48,114 training samples, 3-class sentiment: Negative / Neutral / Positive).
+
+### 1. Main Test Set Performance
+
+| Model | Macro F1 | Precision | Recall | Accuracy | Latency |
+|---|---|---|---|---|---|
+| TF-IDF + Logistic Regression (Baseline) | 49.46% | 49.83% | 49.49% | — | — |
+| 🔹 IndicBERT (`ai4bharat/indic-bert`) | 71.07% | 71.42% | 70.92% | 70.92% | 0.39 ms/sample |
+| 🟣 **MuRIL (`google/muril-base-cased`)** | **81.20%** | **81.17%** | **81.28%** | **81.28%** | **0.42 ms/sample** |
+
+> **MuRIL outperforms IndicBERT by +10.1% Macro F1**, demonstrating superior cross-lingual understanding of Marathi text.
+
+---
+
+### 2. Cross-Domain Generalisation (4 Domains)
+
+| Domain | IndicBERT F1 | MuRIL F1 |
+|---|---|---|
+| Movie Reviews | 68.11% | **79.29%** |
+| Generic Tweets | 67.02% | **77.94%** |
+| TV Subtitles | 72.49% | **79.66%** |
+| Political Tweets | 79.22% | **85.14%** |
+
+---
+
+### 3. Code-Mixed Evaluation (30 Romanized Marathi / Hindi-English Sentences)
+
+| Model | Correct | Accuracy |
+|---|---|---|
+| 🔹 IndicBERT | 19 / 30 | 63.3% |
+| 🟣 **MuRIL** | **24 / 30** | **80.0%** |
+
+---
+
+### 4. Training Loss Curves
+
+| IndicBERT | MuRIL |
+|---|---|
+| ![IndicBERT Loss Curve](results/ai4bharat--indic-bert_loss_curves.png) | ![MuRIL Loss Curve](results/google--muril-base-cased_loss_curves.png) |
+
 ---
 
 ## Directory Structure
