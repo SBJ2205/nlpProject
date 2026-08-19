@@ -13,6 +13,7 @@ venv.bak/
 
 # Model checkpoints & outputs (large binaries)
 outputs/
+saved_models/
 runs/
 checkpoints/
 *.pt

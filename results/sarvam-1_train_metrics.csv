@@ -1,0 +1,2 @@
+train_runtime,train_samples_per_second,train_steps_per_second,total_flos,train_loss,epoch,eval_loss,eval_runtime,eval_samples_per_second,eval_steps_per_second,eval_entropy,eval_num_tokens,eval_mean_token_accuracy
+6499.655,7.403,0.925,7.411207873676083e+16,1.1886104482268653,1.0,1.0996869802474976,191.7179,31.296,3.912,1.1059834030469258,3436506.0,0.7993250555992126

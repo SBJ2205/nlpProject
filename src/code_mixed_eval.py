@@ -113,6 +113,8 @@ def run_code_mixed_evaluation(
     device = detect_device(force_cpu=force_cpu)
     predictor = SentimentPredictor(model_dir=model_dir, device=device)
     model_tag = Path(model_dir).name
+    if "sarvam" in model_tag.lower():
+        model_tag = "sarvam-1"
 
     texts      = [s for s, _ in CODE_MIXED_SAMPLES]
     gold_labels = [lbl for _, lbl in CODE_MIXED_SAMPLES]

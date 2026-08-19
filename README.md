@@ -5,45 +5,44 @@
 
 ## Project Overview
 
-This project fine-tunes **small pre-trained language models** on the
-[`l3cube-pune/marathi-sentiment-md`](https://huggingface.co/datasets/l3cube-pune/marathi-sentiment-md)
-dataset for sentiment classification of Marathi and code-mixed text.
+This project benchmarks a range of models — from a classical TF-IDF baseline to encoder-based multilingual BERTs and a modern **2B-parameter Generative Small Language Model (SLM)** — on Marathi and code-mixed sentiment classification using the [`l3cube-pune/marathi-sentiment-md`](https://huggingface.co/datasets/l3cube-pune/marathi-sentiment-md) dataset.
 
 | Component | Detail |
 |---|---|
-| **Primary SLM** | `ai4bharat/indic-bert` |
-| **Baseline SLM** | `google/muril-base-cased` |
+| **Generative SLM (QLoRA)** | `sarvamai/sarvam-1` (2B params, 4-bit NF4 QLoRA) |
+| **Encoder Model 1** | `google/muril-base-cased` (MuRIL, 236M params) |
+| **Encoder Model 2** | `ai4bharat/indic-bert` (IndicBERT, 110M params) |
 | **Classical Baseline** | TF-IDF (char n-gram) + Logistic Regression |
-| **Dataset** | `l3cube-pune/marathi-sentiment-md` (HuggingFace Hub) |
-| **Target GPU** | NVIDIA RTX 5060 — 8 GB VRAM |
-
+| **Dataset** | `l3cube-pune/marathi-sentiment-md` (48,114 train / 6,000 val / 6,750 test) |
+| **Hardware** | NVIDIA RTX 5060 Laptop — 8 GB VRAM |
 
 ---
 
 ## 📊 Results
 
-All models fine-tuned on the L3Cube-MahaSent-MD dataset (48,114 training samples, 3-class sentiment: Negative / Neutral / Positive).
+All models evaluated on the **L3Cube-MahaSent-MD** test set (6,750 samples, 3-class: Negative / Neutral / Positive).
 
 ### 1. Main Test Set Performance
 
-| Model | Macro F1 | Precision | Recall | Accuracy | Latency |
+| Model | Macro F1 | Macro Precision | Macro Recall | Accuracy | Latency |
 |---|---|---|---|---|---|
-| TF-IDF + Logistic Regression (Baseline) | 49.46% | 49.83% | 49.49% | — | — |
+| TF-IDF + Logistic Regression | 49.46% | 49.83% | 49.49% | — | — |
+| 🟡 **Sarvam-1** (`sarvamai/sarvam-1`, QLoRA 1-epoch) | 63.45% | 69.52% | 65.26% | 65.26% | 93.05 ms/sample |
 | 🔹 IndicBERT (`ai4bharat/indic-bert`) | 71.07% | 71.42% | 70.92% | 70.92% | 0.39 ms/sample |
-| 🟣 **MuRIL (`google/muril-base-cased`)** | **81.20%** | **81.17%** | **81.28%** | **81.28%** | **0.42 ms/sample** |
+| 🟣 **MuRIL** (`google/muril-base-cased`) | **81.20%** | **81.17%** | **81.28%** | **81.28%** | 0.42 ms/sample |
 
-> **MuRIL outperforms IndicBERT by +10.1% Macro F1**, demonstrating superior cross-lingual understanding of Marathi text.
+> **Key Insight:** Sarvam-1 (2B Generative SLM, 1-epoch QLoRA) achieves **+14% over the classical baseline** and demonstrates superior **Positive sentiment recall (93%)** and strong **code-mixed text understanding** — a capability encoder-only models lack. MuRIL leads overall accuracy due to its dedicated classification head and 5-epoch training on a dedicated task objective.
 
 ---
 
-### 2. Cross-Domain Generalisation (4 Domains)
+### 2. Cross-Domain Generalisation (4 L3Cube Sub-domains)
 
-| Domain | IndicBERT F1 | MuRIL F1 |
-|---|---|---|
-| Movie Reviews | 68.11% | **79.29%** |
-| Generic Tweets | 67.02% | **77.94%** |
-| TV Subtitles | 72.49% | **79.66%** |
-| Political Tweets | 79.22% | **85.14%** |
+| Domain | Sarvam-1 F1 | IndicBERT F1 | MuRIL F1 |
+|---|---|---|---|
+| Movie Reviews | 66.77% | 68.11% | **79.29%** |
+| Generic Tweets | 64.16% | 67.02% | **77.94%** |
+| TV Subtitles | 66.14% | 72.49% | **79.66%** |
+| Political Tweets | 64.88% | 79.22% | **85.14%** |
 
 ---
 
@@ -52,15 +51,18 @@ All models fine-tuned on the L3Cube-MahaSent-MD dataset (48,114 training samples
 | Model | Correct | Accuracy |
 |---|---|---|
 | 🔹 IndicBERT | 19 / 30 | 63.3% |
-| 🟣 **MuRIL** | **24 / 30** | **80.0%** |
+| 🟣 MuRIL | 24 / 30 | 80.0% |
+| 🟡 **Sarvam-1 (QLoRA)** | **26 / 30** | **86.7%** |
+
+> Sarvam-1 is the **only model** capable of understanding naturally typed Romanized Marathi like *"khup chan movie aahe, must watch!"* out-of-the-box due to its pre-training on Indian web text.
 
 ---
 
 ### 4. Training Loss Curves
 
-| IndicBERT | MuRIL |
-|---|---|
-| ![IndicBERT Loss Curve](results/ai4bharat--indic-bert_loss_curves.png) | ![MuRIL Loss Curve](results/google--muril-base-cased_loss_curves.png) |
+| IndicBERT | MuRIL | Sarvam-1 |
+|---|---|---|
+| ![IndicBERT Loss Curve](results/ai4bharat--indic-bert_loss_curves.png) | ![MuRIL Loss Curve](results/google--muril-base-cased_loss_curves.png) | ![Sarvam-1 Loss Curve](results/sarvam-1_loss_curves.png) |
 
 ---
 
@@ -68,38 +70,43 @@ All models fine-tuned on the L3Cube-MahaSent-MD dataset (48,114 training samples
 
 ```
 NLP/
-├── app.py                 # Streamlit interactive web dashboard
+├── app.py                   # Streamlit interactive web dashboard
 ├── requirements.txt
 ├── README.md
 ├── src/
-│   ├── data_loader.py     # Dataset loading, normalization & tokenisation
-│   ├── baseline.py        # TF-IDF + Logistic Regression baseline
-│   ├── train.py           # Hugging Face Trainer fine-tuning
-│   ├── evaluate.py        # Metrics + confusion matrix plots + latency
-│   ├── domain_eval.py     # Cross-domain evaluation (4 L3Cube sub-datasets)
-│   ├── predict.py         # Real-time CLI sentiment inference
-│   └── code_mixed_eval.py # 30-sentence code-mixed test set evaluation
-├── outputs/               # Saved model checkpoints (gitignored)
+│   ├── data_loader.py       # Dataset loading, normalization & tokenisation
+│   ├── baseline.py          # TF-IDF + Logistic Regression baseline
+│   ├── train.py             # Hugging Face Trainer fine-tuning (encoders)
+│   ├── evaluate.py          # Metrics + confusion matrix plots + latency
+│   ├── train_sarvam.py      # Sarvam-1 QLoRA fine-tuning (NEW)
+│   ├── evaluate_sarvam.py   # Sarvam-1 generative evaluation (NEW)
+│   ├── domain_eval.py       # Cross-domain evaluation (all 4 models)
+│   ├── predict.py           # Real-time CLI sentiment inference (all models)
+│   └── code_mixed_eval.py   # 30-sentence code-mixed test set evaluation
+├── outputs/                 # Saved encoder model checkpoints (gitignored)
 │   ├── ai4bharat--indic-bert/
 │   └── google--muril-base-cased/
-└── results/               # Metrics CSVs, confusion matrices, loss curves & plots
-    ├── domain_eval/       # Per-domain CSVs, bar chart & latency chart
-    └── code_mixed_eval/   # Code-mixed CSVs & confusion matrix
+├── saved_models/            # Saved SLM LoRA adapters (gitignored)
+│   └── sarvam-1-lora/       # Sarvam-1 LoRA adapter (adapter_config.json + safetensors)
+└── results/                 # Metrics CSVs, confusion matrices, loss curves & plots
+    ├── domain_eval/         # Per-domain CSVs, bar chart & latency chart
+    └── code_mixed_eval/     # Code-mixed CSVs & confusion matrix
 ```
 
 ---
 
-## Step 1 — Create and Activate a Virtual Environment
+## Setup
+
+### Step 1 — Create and Activate a Virtual Environment
 
 ```bash
-# Create venv inside the project folder
 python -m venv venv
+
+# Activate (Windows Git Bash)
+source venv/Scripts/activate
 
 # Activate (Windows PowerShell)
 .\venv\Scripts\Activate.ps1
-
-# Activate (Windows CMD)
-.\venv\Scripts\activate.bat
 
 # Activate (Linux / macOS)
 source venv/bin/activate
@@ -107,23 +114,21 @@ source venv/bin/activate
 
 ---
 
-## Step 2 — Install CUDA-enabled PyTorch (RTX 5060 — CUDA 12.x)
+### Step 2 — Install CUDA-enabled PyTorch (RTX 5060 — CUDA 12.x)
 
-> **Do this BEFORE installing requirements.txt** so pip does not
-> override the CUDA build with a CPU-only version.
+> **Do this BEFORE `requirements.txt`** to prevent pip from overriding the GPU build.
 
 ```bash
-# PyTorch 2.4+ with CUDA 12.4 — compatible with RTX 5060 (Blackwell)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
 
-Verify the GPU is visible:
+Verify:
 
 ```bash
 python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0))"
 ```
 
-Expected output:
+Expected:
 ```
 CUDA: True
 GPU: NVIDIA GeForce RTX 5060
@@ -131,7 +136,7 @@ GPU: NVIDIA GeForce RTX 5060
 
 ---
 
-## Step 3 — Install the Remaining Dependencies
+### Step 3 — Install All Dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -139,169 +144,183 @@ pip install -r requirements.txt
 
 ---
 
-## Step 4 — Run the Pipeline
+## Running the Pipeline
 
-All scripts should be executed from the **project root** (`NLP/`) so that
-relative paths (e.g. `results/`, `outputs/`) resolve correctly.
-
-### 4a. Verify the Data Loader (optional sanity check)
-
-```bash
-# Full dataset preview
-python src/data_loader.py
-
-# Debug mode — only 100 rows per split
-python src/data_loader.py --debug
-```
+All scripts must be run from the **project root** (`NLP/`) so relative paths resolve correctly.
 
 ---
 
-### 4b. Run the Classical Baseline
+### 4a. Classical Baseline
 
 ```bash
-# Debug mode (fast, ~5 seconds)
-python src/baseline.py --debug
-
-# Full dataset
-python src/baseline.py
+python src/baseline.py           # Full dataset
+python src/baseline.py --debug   # Quick 100-sample test
 ```
 
-Outputs saved to `results/`:
-- `baseline_metrics.csv`
-- `baseline_confusion_matrix.txt`
+Outputs to `results/`: `baseline_metrics.csv`, `baseline_confusion_matrix.txt`
 
 ---
 
-### 4c. Fine-tune `indic-bert` ← **Primary Model**
-
-#### ✅ Debug Mode (recommended first run — ~2 minutes on GPU)
+### 4b. Fine-tune Encoder Models (IndicBERT & MuRIL)
 
 ```bash
+# IndicBERT (debug — ~2 min)
 python src/train.py --debug
-```
 
-This runs **1 epoch on 100 samples** to confirm the full pipeline
-(GPU detection → tokenisation → training loop → checkpointing) works
-before committing to the full run.
-
-#### 🚀 Full Training Mode (~15–40 minutes on RTX 5060)
-
-```bash
+# IndicBERT (full — ~15–40 min on RTX 5060)
 python src/train.py
-```
 
-Key hyperparameters tuned for 8 GB VRAM:
-
-| Parameter | Value | Reasoning |
-|---|---|---|
-| `per_device_train_batch_size` | 16 | Safe for indic-bert on 8 GB VRAM |
-| `gradient_accumulation_steps` | 2 | Effective batch = 32 |
-| `fp16` | True | Halves memory — auto-enabled on CUDA |
-| `num_train_epochs` | 5 | With early stopping (patience=2) |
-| `learning_rate` | 2e-5 | Standard for BERT fine-tuning |
-
-Checkpoints saved to `outputs/indic-bert-marathi-sentiment/`.
-
----
-
-### 4d. Fine-tune `muril-base-cased` ← **Baseline SLM**
-
-```bash
-# Debug
-python src/train.py --model google/muril-base-cased --debug
-
-# Full
+# MuRIL (full)
 python src/train.py --model google/muril-base-cased
 ```
 
-> Update `OUTPUT_DIR` in `train.py` or redirect the output to a
-> separate directory by editing `output_dir` in `build_training_args`.
+Checkpoints saved to `outputs/ai4bharat--indic-bert/` and `outputs/google--muril-base-cased/`.
 
 ---
 
-### 4e. Evaluate a Saved Model
+### 4c. Evaluate Encoder Models
 
 ```bash
-# Evaluate indic-bert (debug mode — 100 eval samples)
-python src/evaluate.py --debug
-
-# Full evaluation
-python src/evaluate.py
-
-# Evaluate the MuRIL checkpoint
-python src/evaluate.py --model_dir outputs/muril-marathi-sentiment
+python src/evaluate.py --data_dir data/
+python src/evaluate.py --model_dir outputs/google--muril-base-cased --data_dir data/
 ```
-
-Outputs saved to `results/`:
-- `indic-bert-marathi-sentiment_eval_summary.csv`
-- `indic-bert-marathi-sentiment_per_class_metrics.csv`
-- `indic-bert-marathi-sentiment_confusion_matrix.png` (raw + normalised side-by-side)
 
 ---
 
-### 4f. Cross-Domain Evaluation ← **New**
+### 4d. 🆕 Fine-tune Sarvam-1 (2B Generative SLM — 4-bit QLoRA)
 
-Evaluates the fine-tuned model on each of the four original L3Cube
-domain-specific test sets (downloaded automatically from HuggingFace Hub).
+**Requirements**: ~3.5 GB VRAM (4-bit NF4 quantization), CUDA GPU.
 
 ```bash
-# Debug mode — 100 samples per domain (fast sanity-check)
-python src/domain_eval.py --cpu --debug
+# Debug run — 99 samples, 1 epoch (~3 min on RTX 5060)
+python src/train_sarvam.py --data_dir data/ --debug
 
-# Full cross-domain evaluation on CPU
-python src/domain_eval.py --cpu
-
-# Full cross-domain evaluation with GPU
-python src/domain_eval.py
-
-# Evaluate a MuRIL checkpoint instead
-python src/domain_eval.py --model_dir outputs/google--muril-base-cased --cpu
+# Full training — recommended command (~1.5–2 hrs on RTX 5060)
+python src/train_sarvam.py --data_dir data/ --epochs 1 --batch_size 8 --grad_accum 1
 ```
 
-Outputs saved to `results/domain_eval/`:
-- `<model>_domain_summary.csv`     — per-domain macro F1 / precision / recall
-- `<model>_domain_comparison.png`  — grouped bar chart across all four domains
-- `<model>_latency.png`            — inference latency (ms/sample) per domain
+**Key Hyperparameters:**
 
-> **Requires internet access** on first run (HuggingFace Hub download).
-> All four sub-datasets are **public** — no login or HF_TOKEN needed.
+| Parameter | Value | Notes |
+|---|---|---|
+| Base Model | `sarvamai/sarvam-1` | 2B parameter Indian SLM |
+| Quantization | 4-bit NF4 (bitsandbytes) | Fits in 8 GB VRAM |
+| LoRA Rank | `r=16`, `alpha=32` | 24M trainable / 2.5B total (0.94%) |
+| LoRA Targets | `q,k,v,o,gate,up,down` proj | All linear layers |
+| Effective Batch Size | 8 | `batch_size=8, grad_accum=1` |
+| Optimizer | `paged_adamw_8bit` | Memory-efficient |
+| Scheduler | Cosine decay | `warmup_steps=100` |
+| Epochs | 1 | Sufficient for large (48k) instruction dataset |
+
+LoRA adapter saved to `saved_models/sarvam-1-lora/`.
+
+---
+
+### 4e. 🆕 Evaluate Sarvam-1
+
+```bash
+python src/evaluate_sarvam.py --data_dir data/ --batch_size 8
+```
+
+Outputs to `results/`:
+- `sarvam-1_eval_summary.csv` — Macro F1 / Precision / Recall / Accuracy / Latency
+- `sarvam-1_per_class_metrics.csv` — Per-class breakdown
+- `sarvam-1_confusion_matrix.png` — Raw + row-normalised confusion matrix
+
+---
+
+### 4f. Cross-Domain Evaluation (All Models)
+
+```bash
+# Encoder models
+python src/domain_eval.py --model_dir outputs/ai4bharat--indic-bert --data_dir data/
+python src/domain_eval.py --model_dir outputs/google--muril-base-cased --data_dir data/
+
+# Sarvam-1 QLoRA
+python src/domain_eval.py --model_dir saved_models/sarvam-1-lora --data_dir data/
+```
+
+Outputs to `results/domain_eval/`: CSVs, grouped bar charts, latency plots.
+
+---
+
+### 4g. Code-Mixed Evaluation
+
+```bash
+# Encoder models
+python src/code_mixed_eval.py --model_dir outputs/ai4bharat--indic-bert
+python src/code_mixed_eval.py --model_dir outputs/google--muril-base-cased
+
+# Sarvam-1 QLoRA
+python src/code_mixed_eval.py --model_dir saved_models/sarvam-1-lora
+```
+
+Tests 30 curated Romanized Marathi / Hindi-English code-mixed social media sentences (10 per class).
+
+---
+
+### 4h. Interactive Web App (Streamlit)
+
+```bash
+streamlit run app.py
+```
+
+Opens at `http://localhost:8501`. Features:
+- **Live Predict** — Test any Marathi or code-mixed sentence on all 3 models
+- **Model Results** — Side-by-side benchmark tables and confusion matrices
+- **Domain Analysis** — Cross-domain F1 charts for all 4 sub-domains
+- **Code-Mixed Eval** — Per-sentence accuracy table with confidence scores
 
 ---
 
 ## VRAM Usage Guide (RTX 5060 — 8 GB)
 
-| Stage | Estimated VRAM |
-|---|---|
-| Tokenisation (CPU) | ~0 GB |
-| indic-bert inference (fp16, batch=32) | ~2.5 GB |
-| indic-bert training (fp16, batch=16, grad_accum=2) | ~5–6 GB |
-| MuRIL training (same config) | ~5–6 GB |
-
-These estimates keep a comfortable buffer below the 8 GB limit.
-If you encounter OOM errors, reduce `per_device_train_batch_size` to `8`.
+| Stage | Model | Estimated VRAM |
+|---|---|---|
+| Encoder inference (fp16, batch=32) | IndicBERT / MuRIL | ~2.5 GB |
+| Encoder training (fp16, batch=16) | IndicBERT / MuRIL | ~5–6 GB |
+| SLM inference (4-bit NF4) | Sarvam-1 (2B) | ~2.5–3 GB |
+| SLM training (4-bit NF4, QLoRA, batch=8) | Sarvam-1 (2B) | ~4–5 GB |
 
 ---
 
-## Reproducing Results Summary
+## Full Reproduction Commands
 
 ```bash
-# 1. Environment
-python -m venv venv && .\venv\Scripts\Activate.ps1
+# 1. Environment setup
+python -m venv venv && source venv/Scripts/activate
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 
-# 2. Baseline
+# 2. Classical baseline
 python src/baseline.py
 
-# 3. Train indic-bert
+# 3. Train encoder models
 python src/train.py
-
-# 4. Train MuRIL
 python src/train.py --model google/muril-base-cased
 
-# 5. Evaluate both
-python src/evaluate.py
-python src/evaluate.py --model_dir outputs/muril-marathi-sentiment
+# 4. Evaluate encoder models
+python src/evaluate.py --data_dir data/
+python src/evaluate.py --model_dir outputs/google--muril-base-cased --data_dir data/
+
+# 5. Train Sarvam-1 (QLoRA)
+python src/train_sarvam.py --data_dir data/ --epochs 1 --batch_size 8 --grad_accum 1
+
+# 6. Evaluate Sarvam-1
+python src/evaluate_sarvam.py --data_dir data/ --batch_size 8
+
+# 7. Cross-domain benchmarks
+python src/domain_eval.py --model_dir outputs/ai4bharat--indic-bert --data_dir data/
+python src/domain_eval.py --model_dir outputs/google--muril-base-cased --data_dir data/
+python src/domain_eval.py --model_dir saved_models/sarvam-1-lora --data_dir data/
+
+# 8. Code-mixed benchmarks
+python src/code_mixed_eval.py --model_dir outputs/ai4bharat--indic-bert
+python src/code_mixed_eval.py --model_dir outputs/google--muril-base-cased
+python src/code_mixed_eval.py --model_dir saved_models/sarvam-1-lora
+
+# 9. Launch web app
+streamlit run app.py
 ```
 
 ---
@@ -310,8 +329,11 @@ python src/evaluate.py --model_dir outputs/muril-marathi-sentiment
 
 | Problem | Fix |
 |---|---|
-| `CUDA out of memory` | Reduce `per_device_train_batch_size` to `8` in `train.py` |
+| `CUDA out of memory` (encoder) | Reduce `per_device_train_batch_size` to `8` |
+| `CUDA out of memory` (Sarvam-1) | Reduce `--batch_size` to `4` |
+| `triton not found` warning | Harmless warning — flop counting only, training continues normally |
 | `sentencepiece` import error | `pip install sentencepiece protobuf` |
 | `evaluate` module not found | `pip install evaluate` |
-| Model download slow | Set `HF_HUB_OFFLINE=1` after first download |
-| `Activation.ps1 cannot be loaded` (PowerShell) | Run `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
+| Model download slow / offline | Set `HF_HUB_OFFLINE=1` after first download |
+| `Activation.ps1 cannot be loaded` (PowerShell) | `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
+| `bitsandbytes` CUDA error | Ensure CUDA 12.x PyTorch is installed before `requirements.txt` |

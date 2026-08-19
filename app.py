@@ -159,13 +159,27 @@ LABEL_COLORS = {
 }
 
 MODELS = {
-    "IndicBERT (ai4bharat)": "outputs/ai4bharat--indic-bert",
-    "MuRIL (Google)":        "outputs/google--muril-base-cased",
+    "sarvamai/sarvam-1 (Fine-tuned)": "saved_models/sarvam-1-lora",
+    "MuRIL (Google)":                 "outputs/google--muril-base-cased",
+    "IndicBERT (ai4bharat)":          "outputs/ai4bharat--indic-bert",
 }
-DEBUG_MODELS = {
-    "IndicBERT Debug (ai4bharat)": "outputs/ai4bharat--indic-bert-debug",
-    "MuRIL Debug (Google)":        "outputs/google--muril-base-cased-debug",
+
+MODEL_DISPLAY_NAMES = {
+    "sarvam-1": "Sarvam-1 (2B Generative SLM - LoRA)",
+    "sarvamai--sarvam-1-lora": "Sarvam-1 (2B Generative SLM - LoRA)",
+    "google--muril-base-cased": "MuRIL (Google Multilingual BERT)",
+    "ai4bharat--indic-bert": "IndicBERT (AI4Bharat)",
 }
+
+def model_sort_order(path_or_str) -> int:
+    tag = str(path_or_str).lower()
+    if "sarvam" in tag:
+        return 0
+    if "muril" in tag:
+        return 1
+    if "indic" in tag:
+        return 2
+    return 3
 
 RESULTS_DIR   = Path("results")
 DOMAIN_DIR    = RESULTS_DIR / "domain_eval"
@@ -173,11 +187,11 @@ CODE_MIX_DIR  = RESULTS_DIR / "code_mixed_eval"
 
 
 def get_available_models() -> dict[str, str]:
-    """Return only model dirs that actually exist on disk."""
+    """Return only model dirs that actually exist on disk, ordered Sarvam-1 -> MuRIL -> IndicBERT."""
     available = {}
-    for name, path in {**MODELS, **DEBUG_MODELS}.items():
+    for name, path in MODELS.items():
         p = Path(path)
-        if p.exists() and (p / "config.json").exists():
+        if p.exists() and ((p / "config.json").exists() or (p / "adapter_config.json").exists()):
             available[name] = path
     return available
 
@@ -225,8 +239,10 @@ def render_prediction(result: dict, model_label: str = "") -> None:
 
     make_conf_bars(result["scores"])
 
-    with st.expander("🔍 Normalized input text"):
-        st.code(result["input"], language=None)
+    with st.expander("🔍 Normalized input & SLM generation details"):
+        st.markdown(f"**Normalized text:** `{result['input']}`")
+        if "raw_generation" in result:
+            st.markdown(f"**Raw SLM Generation:** `{result['raw_generation']}`")
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +284,18 @@ with st.sidebar:
     # Show model parameters if config exists
     try:
         import json
-        cfg = json.loads((model_path / "config.json").read_text())
-        hidden = cfg.get("hidden_size", "?")
-        layers = cfg.get("num_hidden_layers", "?")
-        st.markdown(f"**Architecture:** {layers} layers × {hidden} hidden")
+        if (model_path / "adapter_config.json").exists():
+            cfg = json.loads((model_path / "adapter_config.json").read_text())
+            r = cfg.get("r", 16)
+            alpha = cfg.get("lora_alpha", 32)
+            base = cfg.get("base_model_name_or_path", "sarvamai/sarvam-1")
+            st.markdown(f"**Base SLM:** `{base}`")
+            st.markdown(f"**LoRA Config:** rank `r={r}`, `alpha={alpha}` (NF4)")
+        elif (model_path / "config.json").exists():
+            cfg = json.loads((model_path / "config.json").read_text())
+            hidden = cfg.get("hidden_size", "?")
+            layers = cfg.get("num_hidden_layers", "?")
+            st.markdown(f"**Architecture:** {layers} layers × {hidden} hidden")
     except Exception:
         pass
 
@@ -425,10 +449,11 @@ with tab2:
                         <div class='metric-label'>{cname.replace('_', ' ')}</div>
                     </div>""", unsafe_allow_html=True)
 
-        # Neural model eval CSVs
-        for csv_path in sorted(eval_csvs):
+        # Neural model eval CSVs — sorted: Sarvam-1 -> MuRIL -> IndicBERT
+        for csv_path in sorted(eval_csvs, key=lambda p: model_sort_order(p.stem)):
             model_tag = csv_path.stem.replace("_eval_summary", "")
-            st.markdown(f"<div class='section-header'>{model_tag}</div>", unsafe_allow_html=True)
+            display_title = MODEL_DISPLAY_NAMES.get(model_tag, model_tag)
+            st.markdown(f"<div class='section-header'>{display_title}</div>", unsafe_allow_html=True)
             df = pd.read_csv(csv_path)
             numeric_cols = df.select_dtypes(include="number").columns.tolist()
             display_cols = st.columns(len(numeric_cols))
@@ -483,12 +508,14 @@ with tab3:
     if not domain_csvs:
         st.info(
             "No domain evaluation results yet.\n\n"
-            "Run `python src/domain_eval.py --cpu --data_dir data` after training."
+            "Run `python src/domain_eval.py --data_dir data` after training."
         )
     else:
-        for csv_path in sorted(domain_csvs):
+        # Sorted: Sarvam-1 -> MuRIL -> IndicBERT
+        for csv_path in sorted(domain_csvs, key=lambda p: model_sort_order(p.stem)):
             model_tag = csv_path.stem.replace("_domain_summary", "")
-            st.markdown(f"<div class='section-header'>{model_tag}</div>", unsafe_allow_html=True)
+            display_title = MODEL_DISPLAY_NAMES.get(model_tag, model_tag)
+            st.markdown(f"<div class='section-header'>{display_title}</div>", unsafe_allow_html=True)
 
             df = pd.read_csv(csv_path)
             st.dataframe(
@@ -533,12 +560,14 @@ with tab4:
     if not cm_csvs:
         st.info(
             "No code-mixed evaluation results yet.\n\n"
-            "Run `python src/code_mixed_eval.py --cpu` after training."
+            "Run `python src/code_mixed_eval.py` after training."
         )
     else:
-        for csv_path in sorted(cm_csvs):
+        # Sorted: Sarvam-1 -> MuRIL -> IndicBERT
+        for csv_path in sorted(cm_csvs, key=lambda p: model_sort_order(p.stem)):
             model_tag = csv_path.stem.replace("_code_mixed_results", "")
-            st.markdown(f"<div class='section-header'>{model_tag}</div>", unsafe_allow_html=True)
+            display_title = MODEL_DISPLAY_NAMES.get(model_tag, model_tag)
+            st.markdown(f"<div class='section-header'>{display_title}</div>", unsafe_allow_html=True)
 
             df = pd.read_csv(csv_path)
             accuracy = df["correct"].mean() * 100
