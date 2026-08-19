@@ -45,7 +45,17 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
+
+try:
+    from peft import PeftModel
+except ImportError:
+    PeftModel = None
 
 # Make src/ importable when called from project root
 sys.path.insert(0, str(Path(__file__).parent))
@@ -268,15 +278,47 @@ def _load_from_local_csv_split(
     return Dataset.from_pandas(df, features=features, preserve_index=False)
 
 
+PROMPT_TEMPLATE: str = (
+    "Classify the sentiment of the following Marathi text. Reply with ONLY ONE WORD from [Positive, Negative, Neutral].\n"
+    "Text: {text_sample}\n"
+    "Sentiment:"
+)
+
+
+def parse_generated_sentiment(text: str) -> int:
+    """Parse raw generation into label index (0=neg, 1=neu, 2=pos)."""
+    import re
+    cleaned = text.strip().lower()
+    tokens = re.findall(r"\b\w+\b", cleaned)
+    first_token = tokens[0] if tokens else cleaned
+
+    if "pos" in first_token or "आवड" in cleaned or "chan" in cleaned:
+        return 2
+    elif "neg" in first_token or "वाईट" in cleaned or "bakwaas" in cleaned:
+        return 0
+    elif "neu" in first_token or "मध्य" in cleaned or "thik" in cleaned:
+        return 1
+
+    if "positive" in cleaned:
+        return 2
+    if "negative" in cleaned:
+        return 0
+    if "neutral" in cleaned:
+        return 1
+
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
 
 def run_inference(
-    model: AutoModelForSequenceClassification,
+    model,
     tokenizer: AutoTokenizer,
     dataset: Dataset,
     device: str,
+    is_generative: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Run inference on *dataset*.
@@ -296,27 +338,55 @@ def run_inference(
     n_samples: int = 0
 
     model.eval()
-    with torch.no_grad():
-        for i in range(0, len(texts), BATCH_SIZE):
-            batch = texts[i: i + BATCH_SIZE]
-            enc = tokenizer(
-                batch,
-                max_length=128,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(device) for k, v in enc.items()}
+    if is_generative:
+        batch_size = 4
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            prompts = [PROMPT_TEMPLATE.format(text_sample=t) for t in batch]
+            enc = tokenizer(prompts, max_length=256, padding=True, truncation=True, return_tensors="pt")
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc["attention_mask"].to(device)
+            input_lens = attention_mask.sum(dim=1)
 
             t0 = time.perf_counter()
-            logits = model(**enc).logits
-            t1 = time.perf_counter()
-
-            total_time += (t1 - t0)
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=5,
+                    temperature=0.1,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            total_time += (time.perf_counter() - t0)
             n_samples += len(batch)
-            all_preds.extend(
-                torch.argmax(logits, dim=-1).cpu().numpy().tolist()
-            )
+
+            for gen, in_len in zip(outputs, input_lens):
+                new_toks = gen[in_len:]
+                resp_str = tokenizer.decode(new_toks, skip_special_tokens=True)
+                all_preds.append(parse_generated_sentiment(resp_str))
+    else:
+        with torch.no_grad():
+            for i in range(0, len(texts), BATCH_SIZE):
+                batch = texts[i : i + BATCH_SIZE]
+                enc = tokenizer(
+                    batch,
+                    max_length=128,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                enc = {k: v.to(device) for k, v in enc.items()}
+
+                t0 = time.perf_counter()
+                logits = model(**enc).logits
+                t1 = time.perf_counter()
+
+                total_time += (t1 - t0)
+                n_samples += len(batch)
+                all_preds.extend(
+                    torch.argmax(logits, dim=-1).cpu().numpy().tolist()
+                )
 
     ms_per_sample = (total_time / n_samples) * 1000 if n_samples > 0 else 0.0
     return y_true, np.array(all_preds, dtype=np.int64), ms_per_sample
@@ -510,14 +580,65 @@ def run_domain_evaluation(
             f"Run 'python src/train.py --cpu --debug' first to create a checkpoint.{hint}"
         )
 
-    log.info("Loading model from '%s' …", model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_path, local_files_only=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, local_files_only=True
-    )
-    model.to(device)
+    # Check whether model is a LoRA adapter or Causal LM
+    is_adapter = (model_path / "adapter_config.json").exists() if model_path.exists() else False
+    is_sarvam = "sarvam" in model_dir.lower()
+    is_generative = is_adapter or is_sarvam
+
+    if is_generative:
+        base_model_name = "sarvamai/sarvam-1"
+        if is_adapter:
+            try:
+                import json
+                with open(model_path / "adapter_config.json", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    base_model_name = cfg.get("base_model_name_or_path", base_model_name)
+            except Exception:
+                pass
+        log.info("Loading generative tokenizer for '%s' …", base_model_name)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        use_cuda = (device == "cuda")
+        log.info("Loading base causal model '%s' (CUDA=%s) …", base_model_name, use_cuda)
+        if use_cuda:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
+        else:
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+            )
+
+        if is_adapter and PeftModel is not None:
+            log.info("Attaching LoRA adapter from '%s' …", model_path)
+            model = PeftModel.from_pretrained(base_model, str(model_path))
+        else:
+            model = base_model
+        model.eval()
+    else:
+        log.info("Loading model from '%s' …", model_path)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_path, local_files_only=True
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, local_files_only=True
+        )
+        model.to(device)
 
     # Model size
     n_params = sum(p.numel() for p in model.parameters())
@@ -528,6 +649,8 @@ def run_domain_evaluation(
     )
 
     model_tag = Path(model_dir).name
+    if "sarvam" in model_tag.lower():
+        model_tag = "sarvam-1"
     all_metrics: list[dict] = []
 
     for domain_name, hf_id, domain_idx in DOMAIN_CONFIGS:
@@ -545,7 +668,7 @@ def run_domain_evaluation(
             continue
 
         y_true, y_pred, ms_per_sample = run_inference(
-            model, tokenizer, dataset, device
+            model, tokenizer, dataset, device, is_generative=is_generative
         )
         print_domain_report(y_true, y_pred, domain_name, ms_per_sample)
 
