@@ -142,38 +142,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     font-size: 1rem;
 }
 
-/* Reasoning callout card */
-.reasoning-card {
-    background: linear-gradient(135deg, #1a1f2e, #1e2538);
-    border: 1px solid #388bfd55;
-    border-left: 4px solid #58a6ff;
-    border-radius: 10px;
-    padding: 1.1rem 1.4rem;
-    margin: 0.8rem 0 1rem 0;
-}
-.reasoning-title {
-    font-size: 0.82rem;
-    font-weight: 600;
-    color: #58a6ff;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    margin-bottom: 0.5rem;
-}
-.reasoning-text {
-    font-size: 0.97rem;
-    color: #cdd9e5;
-    line-height: 1.6;
-}
-.encoder-note {
-    font-size: 0.8rem;
-    color: #6e7681;
-    font-style: italic;
-    margin-top: 0.5rem;
-    padding: 0.5rem 0.8rem;
-    border-left: 3px solid #30363d;
-    border-radius: 0 4px 4px 0;
-}
-
 /* Info boxes */
 .stAlert { border-radius: 10px; }
 </style>
@@ -271,33 +239,22 @@ def render_prediction(result: dict, model_label: str = "") -> None:
 
     make_conf_bars(result["scores"])
 
+    if "explanation" in result and result["explanation"]:
+        st.markdown(f"""
+        <div style='background:linear-gradient(135deg, #161b22, #1c2128); border-left: 4px solid #58a6ff; border-radius: 8px; padding: 1rem 1.2rem; margin: 1rem 0;'>
+            <div style='color: #58a6ff; font-weight: 600; font-size: 0.95rem; margin-bottom: 0.3rem;'>
+                💡 Explainable AI (XAI) Reasoning:
+            </div>
+            <div style='color: #e6edf3; font-size: 0.95rem; line-height: 1.5;'>
+                {result['explanation']}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     with st.expander("🔍 Normalized input & SLM generation details"):
         st.markdown(f"**Normalized text:** `{result['input']}`")
         if "raw_generation" in result:
             st.markdown(f"**Raw SLM Generation:** `{result['raw_generation']}`")
-
-
-def render_reasoning(reasoning: str) -> None:
-    """Display the XAI reasoning callout card."""
-    st.markdown(
-        f"<div class='reasoning-card'>"
-        f"<div class='reasoning-title'>💡 Model Reasoning / Justification</div>"
-        f"<div class='reasoning-text'>{reasoning}</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-
-def render_encoder_note() -> None:
-    """Show a muted note for encoder models that cannot produce reasoning."""
-    st.markdown(
-        "<div class='encoder-note'>"
-        "ℹ️ Reasoning generation is an exclusive feature of the "
-        "<strong>Generative Decoder SLM (Sarvam-1)</strong>. "
-        "Encoder models (IndicBERT, MuRIL) output class probabilities only."
-        "</div>",
-        unsafe_allow_html=True,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -331,20 +288,6 @@ with st.sidebar:
             label_visibility="collapsed",
         )
         compare_model_dir = available[compare_model_name]
-
-    # XAI reasoning toggle — only shown when Sarvam-1 is selected
-    is_sarvam_selected = "sarvam" in selected_model_dir.lower()
-    reasoning_mode = False
-    if is_sarvam_selected and not compare_mode:
-        st.divider()
-        st.markdown("#### 🧠 SLM Reasoning (XAI)")
-        reasoning_mode = st.toggle(
-            "Enable Reasoning & Explanation",
-            value=False,
-            help="Sarvam-1 will explain WHY it assigned this sentiment label — detecting emotional cues and keywords in the text.",
-        )
-        if reasoning_mode:
-            st.caption("⚡ Slower (~3–5s) — generates a full explanation.")
 
     st.divider()
     model_path = Path(selected_model_dir)
@@ -452,30 +395,25 @@ with tab1:
         label_visibility="collapsed",
     )
 
-    analyze_btn = st.button("🔍 Analyze Sentiment", use_container_width=True)
+    c_btn, c_xai = st.columns([2, 2])
+    with c_btn:
+        analyze_btn = st.button("🔍 Analyze Sentiment", use_container_width=True)
+    with c_xai:
+        enable_xai = st.checkbox("💡 Generate Explainable AI Reasoning (XAI)", value=True)
 
     if analyze_btn and user_text.strip():
-        # Show encoder note immediately when not using Sarvam-1
-        if not is_sarvam_selected:
-            render_encoder_note()
-
-        spinner_msg = "Generating reasoning & explanation…" if reasoning_mode else "Running inference…"
-        with st.spinner(spinner_msg):
+        with st.spinner("Running inference & reasoning…"):
             predictor1 = load_predictor(selected_model_dir)
-
-            if reasoning_mode and is_sarvam_selected:
-                result1 = predictor1.predict_with_reasoning(user_text)
-            else:
-                result1 = predictor1.predict(user_text)
+            result1    = predictor1.predict(user_text, with_reasoning=enable_xai)
 
             if compare_mode and len(available) >= 2:
                 predictor2 = load_predictor(compare_model_dir)
-                result2    = predictor2.predict(user_text)
+                result2    = predictor2.predict(user_text, with_reasoning=enable_xai)
 
         st.divider()
 
         if compare_mode and len(available) >= 2:
-            # Side-by-side (no reasoning in compare mode)
+            # Side-by-side
             col_a, col_b = st.columns(2)
             with col_a:
                 render_prediction(result1, model_label=f"🔵 {selected_model_name}")
@@ -492,9 +430,6 @@ with tab1:
                 )
         else:
             render_prediction(result1, model_label=selected_model_name)
-            # XAI Reasoning card — only shown when Sarvam-1 + toggle is ON
-            if reasoning_mode and "reasoning" in result1 and result1["reasoning"]:
-                render_reasoning(result1["reasoning"])
 
     elif analyze_btn:
         st.warning("Please enter some text first.")

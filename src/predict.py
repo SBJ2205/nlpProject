@@ -30,6 +30,14 @@ import sys
 import time
 from pathlib import Path
 
+# Fix Windows console UTF-8 output encoding for Marathi/Devanagari
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import torch
 from transformers import (
     AutoModelForCausalLM,
@@ -69,10 +77,15 @@ PROMPT_TEMPLATE: str = (
     "Sentiment:"
 )
 
-# Sentence continuation starter for step 2 of reasoning generation.
-# We append this directly onto step 1's full output (prompt + label)
-# so the model continues generating the explanation naturally.
-REASONING_CONTINUATION: str = " This sentiment is evident because"
+REASONING_PROMPT_TEMPLATE: str = (
+    "Explain why the following Marathi text has a {label} sentiment.\n"
+    "Text: Khup bhari movie aahe, maza aali.\n"
+    "Explanation: The text uses the positive Marathi slang \"bhari\" (great) and expresses enjoyment.\n\n"
+    "Text: Ekdum bakwas product, waste of money.\n"
+    "Explanation: The user expresses strong dissatisfaction using the negative word \"bakwas\" (trash).\n\n"
+    "Text: {text_sample}\n"
+    "Explanation:"
+)
 
 
 def parse_generated_sentiment(text: str) -> tuple[int, str]:
@@ -194,10 +207,14 @@ class SentimentPredictor:
         self.model.eval()
         log.info("Generative SLM initialized on device '%s'.", self.device)
 
-    def predict(self, text: str) -> dict:
+    def predict(self, text: str, with_reasoning: bool = False) -> dict:
         """
         Predict sentiment for a single text string.
+        Optionally generates natural language reasoning (XAI) if with_reasoning=True.
         """
+        if with_reasoning:
+            return self.predict_with_reasoning(text)
+
         normalised = normalize_text(text)
 
         if self.is_generative:
@@ -264,103 +281,63 @@ class SentimentPredictor:
 
     def predict_with_reasoning(self, text: str) -> dict:
         """
-        Predict sentiment AND generate a natural-language explanation (XAI).
-
-        Uses a two-step approach so the fine-tuned model's classification
-        strength is preserved while also getting a meaningful explanation:
-          Step 1 — fast single-token generation using the original fine-tuned
-                   prompt to get the accurate sentiment label.
-          Step 2 — explanation generation with the label already filled in,
-                   asking the model to explain WHY that sentiment applies.
-
-        Encoder-based models (IndicBERT, MuRIL) fall back to predict() with
-        an informational reasoning note.
+        Two-Step Contextual Adapter Switching (XAI):
+        --------------------------------------------
+        Stage 1: Label Generation (Adapter ENABLED)
+          - Prompt strict single-word classification
+          - Generates: [Positive, Negative, Neutral]
+        Stage 2: Reasoning Generation (Adapter DISABLED)
+          - Temporarily disables LoRA adapter to avoid single-word truncation
+          - Few-Shot prompt guides base model to justify the Stage 1 label
         """
+        # Stage 1: Label Generation (Adapter ENABLED)
+        result = self.predict(text, with_reasoning=False)
+
         if not self.is_generative:
-            result = self.predict(text)
-            result["reasoning"] = (
-                "Reasoning generation is an exclusive feature of the "
-                "Generative Decoder SLM (Sarvam-1). This encoder model outputs "
-                "class probabilities only."
-            )
+            result["explanation"] = "Natural language explanation (XAI) is only available for Generative SLM models (Sarvam-1)."
             return result
 
-        normalised = normalize_text(text)
-        device = self.model.device if hasattr(self.model, "device") else self.device
-        t_start = time.perf_counter()
+        normalised = result["input"]
+        label_str = result["label"].capitalize()
 
-        # ── Step 1: Fast label classification (same as predict()) ─────────────
-        prompt1 = PROMPT_TEMPLATE.format(text_sample=normalised)
-        inputs1 = self.tokenizer(prompt1, return_tensors="pt")
-        inputs1 = {k: v.to(device) for k, v in inputs1.items()}
-        input_len1 = inputs1["input_ids"].shape[1]
+        # Stage 2: Reasoning Generation (Adapter DISABLED)
+        reasoning_prompt = REASONING_PROMPT_TEMPLATE.format(label=label_str, text_sample=normalised)
+        inputs = self.tokenizer(reasoning_prompt, return_tensors="pt")
+        inputs = {k: v.to(self.model.device if hasattr(self.model, "device") else self.device) for k, v in inputs.items()}
+        input_len = inputs["input_ids"].shape[1]
 
-        with torch.no_grad():
-            out1 = self.model.generate(
-                **inputs1,
-                max_new_tokens=5,
-                do_sample=False,
-                temperature=0.1,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        label_text = self.tokenizer.decode(
-            out1[0][input_len1:], skip_special_tokens=True
-        ).strip()
-        _, pred_label_lc = parse_generated_sentiment(label_text)
-        label_display = pred_label_lc.capitalize()   # e.g. "Negative"
+        from contextlib import nullcontext
+        adapter_ctx = self.model.disable_adapter() if hasattr(self.model, "disable_adapter") else nullcontext()
 
-        # ── Step 2: Continuation — append sentence starter onto step 1's output ──
-        # Build: full_prompt + " Negative This sentiment is evident because"
-        # The model just needs to complete the sentence.
-        continuation_prefix = f" {label_display}{REASONING_CONTINUATION}"
-        cont_input_ids = self.tokenizer(
-            prompt1 + continuation_prefix,
-            return_tensors="pt",
-        )["input_ids"].to(device)
-        cont_input_len = cont_input_ids.shape[1]
+        t0 = time.perf_counter()
+        with adapter_ctx:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=80,
+                    temperature=0.3,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+        reasoning_latency_ms = (time.perf_counter() - t0) * 1000
+        result["latency_ms"] += reasoning_latency_ms
 
-        with torch.no_grad():
-            out2 = self.model.generate(
-                input_ids=cont_input_ids,
-                max_new_tokens=80,
-                temperature=0.45,
-                top_p=0.9,
-                repetition_penalty=1.15,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        latency_ms = (time.perf_counter() - t_start) * 1000
+        new_tokens = outputs[0][input_len:]
+        raw_explanation = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-        continuation_raw = self.tokenizer.decode(
-            out2[0][cont_input_len:], skip_special_tokens=True
-        ).strip()
+        # Clean up explanation text (cut off any accidental extra few-shot continuation)
+        explanation = raw_explanation
+        for delimiter in ["\nText:", "\nExplanation:", "\n\n"]:
+            if delimiter in explanation:
+                explanation = explanation.split(delimiter)[0].strip()
 
-        # Build the full reasoning sentence: "This sentiment is evident because <continuation>"
-        full_reasoning = f"This {label_display.lower()} sentiment is evident because {continuation_raw}"
-        # Stop at first double-newline and cap length
-        reasoning = full_reasoning.split("\n\n")[0].strip()[:500]
-        if not reasoning or len(reasoning) < 20:
-            reasoning = (
-                f"The text expresses {label_display.lower()} sentiment based on "
-                f"the emotional tone and keywords detected in the input."
-            )
+        result["explanation"] = explanation if explanation else raw_explanation
+        return result
 
-        pred_idx = {"negative": 0, "neutral": 1, "positive": 2}[pred_label_lc]
-        scores = {name: (0.88 if i == pred_idx else 0.06) for i, name in enumerate(LABEL_NAMES)}
-
-        return {
-            "label": pred_label_lc,
-            "confidence": scores[pred_label_lc],
-            "scores": scores,
-            "latency_ms": latency_ms,
-            "input": normalised,
-            "raw_generation": explanation_raw,
-            "reasoning": reasoning,
-        }
-
-    def predict_batch(self, texts: list[str]) -> list[dict]:
+    def predict_batch(self, texts: list[str], with_reasoning: bool = False) -> list[dict]:
         """Run predict() on a list of sentences."""
-        return [self.predict(t) for t in texts]
+        return [self.predict(t, with_reasoning=with_reasoning) for t in texts]
 
 
 # ---------------------------------------------------------------------------
@@ -383,10 +360,10 @@ def _format_result(result: dict) -> str:
     for cls, prob in result["scores"].items():
         marker = " <--" if cls == label else ""
         lines.append(f"    {cls:<10} {prob * 100:>5.1f}%{marker}")
-    if "reasoning" in result and result["reasoning"]:
-        lines.append(f"  💡 Reasoning : {result['reasoning'][:200]}")
-    elif "raw_generation" in result:
+    if "raw_generation" in result:
         lines.append(f"  SLM Output  : '{result['raw_generation']}'")
+    if "explanation" in result:
+        lines.append(f"  Explanation : {result['explanation']}")
     lines.append(f"  Input text  : {result['input'][:80]}{'...' if len(result['input']) > 80 else ''}")
     return "\n".join(lines)
 
@@ -403,7 +380,7 @@ def _print_header(model_dir: str) -> None:
 # Run modes
 # ---------------------------------------------------------------------------
 
-def run_interactive(predictor: SentimentPredictor, model_dir: str) -> None:
+def run_interactive(predictor: SentimentPredictor, model_dir: str, with_reasoning: bool = False) -> None:
     """Start the interactive REPL loop."""
     _print_header(model_dir)
     while True:
@@ -419,17 +396,17 @@ def run_interactive(predictor: SentimentPredictor, model_dir: str) -> None:
             print("Goodbye!")
             break
 
-        result = predictor.predict(text)
+        result = predictor.predict(text, with_reasoning=with_reasoning)
         print(_format_result(result))
 
 
-def run_single(predictor: SentimentPredictor, text: str) -> None:
+def run_single(predictor: SentimentPredictor, text: str, with_reasoning: bool = False) -> None:
     """Predict and print for a single --text argument."""
-    result = predictor.predict(text)
+    result = predictor.predict(text, with_reasoning=with_reasoning)
     print(_format_result(result))
 
 
-def run_file(predictor: SentimentPredictor, filepath: str) -> None:
+def run_file(predictor: SentimentPredictor, filepath: str, with_reasoning: bool = False) -> None:
     """Predict all sentences in a text file (one per line)."""
     path = Path(filepath)
     if not path.exists():
@@ -440,7 +417,7 @@ def run_file(predictor: SentimentPredictor, filepath: str) -> None:
     log.info("Running batch prediction on %d sentences from '%s' …", len(lines), filepath)
     print("\n" + "═" * 58)
     for i, sentence in enumerate(lines, 1):
-        result = predictor.predict(sentence)
+        result = predictor.predict(sentence, with_reasoning=with_reasoning)
         print(f"\n[{i}/{len(lines)}]{_format_result(result)}")
     print("\n" + "═" * 58)
     log.info("Done.")
@@ -473,6 +450,11 @@ def _parse_args() -> argparse.Namespace:
         help="Path to a .txt file with one sentence per line for batch prediction.",
     )
     parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Generate natural language reasoning (XAI) using base model Few-Shot bypass.",
+    )
+    parser.add_argument(
         "--cpu",
         action="store_true",
         help="Force CPU execution.",
@@ -486,8 +468,8 @@ if __name__ == "__main__":
     predictor = SentimentPredictor(model_dir=args.model_dir, device=device)
 
     if args.file:
-        run_file(predictor, args.file)
+        run_file(predictor, args.file, with_reasoning=args.explain)
     elif args.text:
-        run_single(predictor, args.text)
+        run_single(predictor, args.text, with_reasoning=args.explain)
     else:
-        run_interactive(predictor, args.model_dir)
+        run_interactive(predictor, args.model_dir, with_reasoning=args.explain)
