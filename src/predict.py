@@ -69,21 +69,10 @@ PROMPT_TEMPLATE: str = (
     "Sentiment:"
 )
 
-# Extended prompt for XAI reasoning — used ONLY by predict_with_reasoning().
-# Eval scripts (evaluate_sarvam.py, domain_eval.py, code_mixed_eval.py) still
-# use the original PROMPT_TEMPLATE above and are completely unaffected.
-#
-# Two-step approach:
-#   Step 1 — use PROMPT_TEMPLATE (fast, single-token) to get the accurate label
-#   Step 2 — use EXPLANATION_PROMPT_TEMPLATE with label pre-filled to generate reasoning
-EXPLANATION_PROMPT_TEMPLATE: str = (
-    "The sentiment of the following Marathi or code-mixed text is {label}.\n"
-    "Explain in 1-2 concise sentences why this text expresses {label} sentiment. "
-    "Mention specific emotional words, tone, or keywords present in the text.\n\n"
-    "Text: {text_sample}\n"
-    "Explanation:"
-)
-
+# Sentence continuation starter for step 2 of reasoning generation.
+# We append this directly onto step 1's full output (prompt + label)
+# so the model continues generating the explanation naturally.
+REASONING_CONTINUATION: str = " This sentiment is evident because"
 
 
 def parse_generated_sentiment(text: str) -> tuple[int, str]:
@@ -320,20 +309,21 @@ class SentimentPredictor:
         _, pred_label_lc = parse_generated_sentiment(label_text)
         label_display = pred_label_lc.capitalize()   # e.g. "Negative"
 
-        # ── Step 2: Explanation generation with label pre-filled ──────────────
-        prompt2 = EXPLANATION_PROMPT_TEMPLATE.format(
-            label=label_display,
-            text_sample=normalised,
-        )
-        inputs2 = self.tokenizer(prompt2, return_tensors="pt")
-        inputs2 = {k: v.to(device) for k, v in inputs2.items()}
-        input_len2 = inputs2["input_ids"].shape[1]
+        # ── Step 2: Continuation — append sentence starter onto step 1's output ──
+        # Build: full_prompt + " Negative This sentiment is evident because"
+        # The model just needs to complete the sentence.
+        continuation_prefix = f" {label_display}{REASONING_CONTINUATION}"
+        cont_input_ids = self.tokenizer(
+            prompt1 + continuation_prefix,
+            return_tensors="pt",
+        )["input_ids"].to(device)
+        cont_input_len = cont_input_ids.shape[1]
 
         with torch.no_grad():
             out2 = self.model.generate(
-                **inputs2,
-                max_new_tokens=100,
-                temperature=0.35,
+                input_ids=cont_input_ids,
+                max_new_tokens=80,
+                temperature=0.45,
                 top_p=0.9,
                 repetition_penalty=1.15,
                 do_sample=True,
@@ -341,17 +331,19 @@ class SentimentPredictor:
             )
         latency_ms = (time.perf_counter() - t_start) * 1000
 
-        explanation_raw = self.tokenizer.decode(
-            out2[0][input_len2:], skip_special_tokens=True
+        continuation_raw = self.tokenizer.decode(
+            out2[0][cont_input_len:], skip_special_tokens=True
         ).strip()
 
-        # Clean up: stop at double newline, strip label echoes, cap length
-        reasoning = explanation_raw.split("\n\n")[0].strip()
-        # Strip any leading label word the model might echo back
-        for strip_word in (label_display, label_display.upper(), label_display.lower()):
-            if reasoning.startswith(strip_word):
-                reasoning = reasoning[len(strip_word):].lstrip(": ").strip()
-        reasoning = reasoning[:500] if reasoning else "No explanation generated."
+        # Build the full reasoning sentence: "This sentiment is evident because <continuation>"
+        full_reasoning = f"This {label_display.lower()} sentiment is evident because {continuation_raw}"
+        # Stop at first double-newline and cap length
+        reasoning = full_reasoning.split("\n\n")[0].strip()[:500]
+        if not reasoning or len(reasoning) < 20:
+            reasoning = (
+                f"The text expresses {label_display.lower()} sentiment based on "
+                f"the emotional tone and keywords detected in the input."
+            )
 
         pred_idx = {"negative": 0, "neutral": 1, "positive": 2}[pred_label_lc]
         scores = {name: (0.88 if i == pred_idx else 0.06) for i, name in enumerate(LABEL_NAMES)}
