@@ -69,6 +69,29 @@ PROMPT_TEMPLATE: str = (
     "Sentiment:"
 )
 
+# Extended prompt for XAI reasoning — used ONLY by predict_with_reasoning().
+# Eval scripts (evaluate_sarvam.py, domain_eval.py, code_mixed_eval.py) still
+# use the original PROMPT_TEMPLATE above and are completely unaffected.
+REASONING_PROMPT_TEMPLATE: str = (
+    "Classify the sentiment of the following Marathi or Code-Mixed text and explain the reasoning behind your decision.\n"
+    "Format your output exactly as:\n"
+    "Sentiment: <Positive/Negative/Neutral>\n"
+    "Reasoning: <1-2 concise sentences explaining the sentiment and emotional cues/keywords identified in the text>\n"
+    "\n"
+    "Text: {text_sample}\n"
+    "Sentiment:"
+)
+
+# Regex to extract structured fields from reasoning generation output
+_SENTIMENT_RE = re.compile(
+    r"(?:^|\n)\s*(?:Sentiment\s*:\s*)?(?P<sentiment>Positive|Negative|Neutral)",
+    re.IGNORECASE,
+)
+_REASONING_RE = re.compile(
+    r"Reasoning\s*:\s*(?P<reasoning>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def parse_generated_sentiment(text: str) -> tuple[int, str]:
     """Parse raw generation into label index and name."""
@@ -257,6 +280,86 @@ class SentimentPredictor:
             "input": normalised,
         }
 
+    def predict_with_reasoning(self, text: str) -> dict:
+        """
+        Predict sentiment AND generate a natural-language explanation (XAI).
+
+        Only valid for generative SLMs (Sarvam-1). Falls back to standard
+        predict() for encoder-based models.
+
+        Returns the same dict as predict() plus:
+          'reasoning': str — extracted explanation text.
+          'raw_generation': str — full raw model output (for debugging).
+        """
+        if not self.is_generative:
+            result = self.predict(text)
+            result["reasoning"] = (
+                "Reasoning generation is an exclusive feature of the "
+                "Generative Decoder SLM (Sarvam-1). This encoder model outputs "
+                "class probabilities only."
+            )
+            return result
+
+        normalised = normalize_text(text)
+        prompt = REASONING_PROMPT_TEMPLATE.format(text_sample=normalised)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        device = self.model.device if hasattr(self.model, "device") else self.device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        input_len = inputs["input_ids"].shape[1]
+
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=100,
+                temperature=0.3,
+                top_p=0.9,
+                repetition_penalty=1.1,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        new_tokens = outputs[0][input_len:]
+        gen_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+        # ── Parse sentiment ──────────────────────────────────────────────────
+        sentiment_match = _SENTIMENT_RE.search(gen_text)
+        if sentiment_match:
+            raw_sentiment = sentiment_match.group("sentiment").capitalize()
+        else:
+            # Fallback: use the fast single-token parser
+            _, raw_sentiment_lc = parse_generated_sentiment(gen_text)
+            raw_sentiment = raw_sentiment_lc.capitalize()
+
+        # Normalise to one of the three valid labels
+        if raw_sentiment.lower() not in ("positive", "negative", "neutral"):
+            raw_sentiment = "Neutral"
+        pred_label = raw_sentiment.lower()
+        pred_idx = {"negative": 0, "neutral": 1, "positive": 2}[pred_label]
+
+        # ── Parse reasoning ──────────────────────────────────────────────────
+        reasoning_match = _REASONING_RE.search(gen_text)
+        if reasoning_match:
+            reasoning = reasoning_match.group("reasoning").strip()
+            # Trim at double newlines or excessive length
+            reasoning = reasoning.split("\n\n")[0].strip()
+            reasoning = reasoning[:500]  # Hard cap
+        else:
+            reasoning = gen_text.strip() or "No reasoning extracted from model output."
+
+        scores = {name: (0.88 if i == pred_idx else 0.06) for i, name in enumerate(LABEL_NAMES)}
+
+        return {
+            "label": pred_label,
+            "confidence": scores[pred_label],
+            "scores": scores,
+            "latency_ms": latency_ms,
+            "input": normalised,
+            "raw_generation": gen_text,
+            "reasoning": reasoning,
+        }
+
     def predict_batch(self, texts: list[str]) -> list[dict]:
         """Run predict() on a list of sentences."""
         return [self.predict(t) for t in texts]
@@ -282,7 +385,9 @@ def _format_result(result: dict) -> str:
     for cls, prob in result["scores"].items():
         marker = " <--" if cls == label else ""
         lines.append(f"    {cls:<10} {prob * 100:>5.1f}%{marker}")
-    if "raw_generation" in result:
+    if "reasoning" in result and result["reasoning"]:
+        lines.append(f"  💡 Reasoning : {result['reasoning'][:200]}")
+    elif "raw_generation" in result:
         lines.append(f"  SLM Output  : '{result['raw_generation']}'")
     lines.append(f"  Input text  : {result['input'][:80]}{'...' if len(result['input']) > 80 else ''}")
     return "\n".join(lines)
