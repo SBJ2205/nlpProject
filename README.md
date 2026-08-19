@@ -52,7 +52,7 @@ All models evaluated on the **L3Cube-MahaSent-MD** test set (6,750 samples, 3-cl
 |---|---|---|
 | 🔹 IndicBERT | 19 / 30 | 63.3% |
 | 🟣 MuRIL | 24 / 30 | 80.0% |
-| 🟡 **Sarvam-1 (QLoRA)** | *Run `code_mixed_eval.py` to generate* | — |
+| 🟡 **Sarvam-1 (QLoRA)** | **26 / 30** | **86.7%** |
 
 > Sarvam-1 is the **only model** capable of understanding naturally typed Romanized Marathi like *"khup chan movie aahe, must watch!"* out-of-the-box due to its pre-training on Indian web text.
 
