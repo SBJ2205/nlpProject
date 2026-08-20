@@ -1,46 +1,38 @@
 # ============================================================
 # Requirements for:
-#   Fine-tuning Small Language Models for
-#   Multilingual Sentiment Analysis (Marathi / Code-mixed)
+#   Hardware-Adaptive Sarvam-1 QLoRA Fine-Tuning Framework
 # ============================================================
 
-# ------------------------------------------------------------------
-# PyTorch — Install CUDA-enabled build FIRST (before this file).
-# Do NOT use `pip install torch` from this file for CUDA support.
-#
-# For CUDA 12.x (RTX 5060 / Blackwell arch, PyTorch >= 2.4):
+# Core ML / PyTorch
+# PyTorch with CUDA support should be installed via:
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-#
-# Verify GPU is visible after install:
-#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-# ------------------------------------------------------------------
+torch>=2.2.0
+torchvision
+torchaudio
 
-# Core ML / NLP
+# Hugging Face & QLoRA Stack
 transformers>=4.40.0
 datasets>=2.18.0
 evaluate>=0.4.1
-accelerate>=0.29.0          # Required by Hugging Face Trainer for mixed-precision
+accelerate>=0.29.0
 tokenizers>=0.19.0
-peft>=0.10.0                # Parameter-Efficient Fine-Tuning (QLoRA)
-bitsandbytes>=0.43.0        # 4-bit / 8-bit quantization
-trl>=0.8.6                  # SFTTrainer for causal language models
+peft>=0.10.0
+bitsandbytes>=0.43.0
+trl>=0.8.6
 
-# Classical ML baseline
+# Classical ML & Evaluation
 scikit-learn>=1.4.2
 scipy>=1.13.0
 
-# Data handling
+# Data Handling & Plotting
 pandas>=2.2.2
 numpy>=1.26.4
-
-# Visualisation
 matplotlib>=3.8.4
 seaborn>=0.13.2
 
 # Utilities
 tqdm>=4.66.2
-sentencepiece>=0.2.0        # Required by indic-bert / MuRIL tokenisers
-protobuf>=4.25.3            # Required by sentencepiece
+sentencepiece>=0.2.0
+protobuf>=4.25.3
 huggingface-hub>=0.22.2
-
 streamlit>=1.35.0

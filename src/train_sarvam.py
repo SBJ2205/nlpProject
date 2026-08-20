@@ -1,46 +1,48 @@
 """
 train_sarvam.py
 ===============
-Fine-tunes the generative Small Language Model (SLM) `sarvamai/sarvam-1` (2B)
-on the Marathi Sentiment Dataset (MahaSent-MD) using 4-bit QLoRA (Parameter-Efficient Fine-Tuning).
+Hardware-adaptive QLoRA fine-tuning framework for `sarvamai/sarvam-1` (2B) SLM
+on the Marathi Sentiment Dataset (MahaSent-MD).
 
 Key Features:
-- 4-bit NormalFloat (NF4) quantization via bitsandbytes
-- bfloat16 compute dtype to prevent NaN loss spikes
-- LoRA targeting all linear projection layers (q, k, v, o, gate, up, down)
-- Instruction-style prompt formatting for causal sentiment classification
-- SFTTrainer training loop with evaluation & checkpointing
-- Generates and saves loss curve visualization in results/
-
-Usage:
-------
-# Full fine-tuning (GPU with QLoRA)
-python src/train_sarvam.py --data_dir data/
-
-# Fast debug run (99 rows, 1 epoch)
-python src/train_sarvam.py --data_dir data/ --debug
+- Auto-detects hardware (VRAM, CUDA version, compute capability, precision support)
+- Auto-configures 4-bit QLoRA parameters (batch size, grad accum, seq len, grad checkpointing)
+- Memory validation dry run with automatic CUDA OOM fallback handling
+- Preserves original dataset CSV files strictly read-only
+- Evaluates per epoch tracking Macro-F1, Precision, Recall, Accuracy
+- Saves per-epoch checkpoints (checkpoint-epoch-1..N) and selects best model by Macro-F1
+- Generates loss curves and comprehensive training metrics in results/
 """
 
 import argparse
 import logging
 import os
 import sys
+import time
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 from datasets import Dataset, DatasetDict
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
     TrainingArguments,
 )
 
-# Make src/ importable when called from project root
+# Make src/ importable
 sys.path.insert(0, str(Path(__file__).parent))
+from auto_config import dry_run_memory_check, get_auto_config
 from data_loader import LABEL_NAMES, load_raw_dataset
+from gpu_detector import print_hardware_report
 
 try:
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -62,13 +64,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 DEFAULT_MODEL: str = "sarvamai/sarvam-1"
 DEFAULT_OUTPUT_DIR: str = "saved_models/sarvam-1-lora"
 RESULTS_DIR: Path = Path("results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_CACHE_DIR: str = str(Path(__file__).parent.parent / "model")
+os.environ["HF_HOME"] = MODEL_CACHE_DIR
+os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE_DIR
 
 PROMPT_TEMPLATE: str = (
     "Classify the sentiment of the following Marathi text. Reply with ONLY ONE WORD from [Positive, Negative, Neutral].\n"
@@ -76,7 +79,6 @@ PROMPT_TEMPLATE: str = (
     "Sentiment: {label}"
 )
 
-# Mapping from class index (0=neg, 1=neu, 2=pos) or name to Capitalized prompt label
 INT_TO_LABEL_STR: dict[int, str] = {
     0: "Negative",
     1: "Neutral",
@@ -92,12 +94,8 @@ STR_TO_LABEL_STR: dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Loss Curve Plotting
-# ---------------------------------------------------------------------------
-
 def plot_loss_curves(log_history: list[dict], output_plot_path: Path, model_tag: str = "sarvam-1") -> None:
-    """Save a training / validation loss curve PNG from Trainer log history."""
+    """Save training / validation loss curve PNG from Trainer log history."""
     train_steps, train_losses = [], []
     eval_steps, eval_losses = [], []
 
@@ -142,16 +140,8 @@ def plot_loss_curves(log_history: list[dict], output_plot_path: Path, model_tag:
     log.info("Loss curves saved → %s", output_plot_path)
 
 
-# ---------------------------------------------------------------------------
-# Dataset Formatting
-# ---------------------------------------------------------------------------
-
 def format_dataset_for_sft(raw_ds: DatasetDict) -> DatasetDict:
-    """
-    Format dataset splits into instruction text format.
-    Format:
-      "Classify the sentiment of the following Marathi text. Reply with ONLY ONE WORD from [Positive, Negative, Neutral].\nText: {text_sample}\nSentiment: {label}"
-    """
+    """Format dataset splits into prompt instruction format in-memory."""
     formatted_dict = {}
 
     for split_name, ds in raw_ds.items():
@@ -176,81 +166,129 @@ def format_dataset_for_sft(raw_ds: DatasetDict) -> DatasetDict:
     return DatasetDict(formatted_dict)
 
 
-# ---------------------------------------------------------------------------
-# Training Pipeline
-# ---------------------------------------------------------------------------
+class EpochSaverCallback(TrainerCallback):
+    """Callback to ensure clear checkpoint naming per epoch."""
+
+    def __init__(self, output_dir: str):
+        self.output_dir = Path(output_dir)
+
+    def on_epoch_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        epoch_idx = int(round(state.epoch)) if state.epoch else 1
+        epoch_dir = self.output_dir / f"checkpoint-epoch-{epoch_idx}"
+        model = kwargs.get("model")
+        tokenizer = kwargs.get("processing_class") or kwargs.get("tokenizer")
+
+        if model and not epoch_dir.exists():
+            log.info("Saving epoch %d checkpoint to '%s' …", epoch_idx, epoch_dir)
+            model.save_pretrained(epoch_dir)
+            if tokenizer:
+                tokenizer.save_pretrained(epoch_dir)
+
 
 def train_sarvam(
     model_name: str = DEFAULT_MODEL,
     output_dir: str = DEFAULT_OUTPUT_DIR,
-    data_dir: str = None,
+    data_dir: Optional[str] = None,
     debug: bool = False,
-    epochs: int = 3,
-    batch_size: int = 2,
-    gradient_accumulation_steps: int = 4,
-    learning_rate: float = 2e-4,
+    epochs: int = 4,
+    batch_size: Optional[int] = None,
+    gradient_accumulation_steps: Optional[int] = None,
+    seq_length: Optional[int] = None,
+    learning_rate: Optional[float] = None,
+    lora_r: Optional[int] = None,
+    gradient_checkpointing: Optional[bool] = None,
     force_cpu: bool = False,
+    skip_dry_run: bool = False,
 ) -> None:
-    """Fine-tune Sarvam-1 using 4-bit QLoRA."""
+    """Execute hardware-adaptive Sarvam-1 QLoRA fine-tuning."""
     if LoraConfig is None or SFTTrainer is None:
         raise ImportError(
-            "peft and trl are required for training Sarvam-1. Please run: pip install peft trl bitsandbytes"
+            "peft and trl libraries are required. Please run: pip install peft trl bitsandbytes"
         )
 
-    use_cuda = torch.cuda.is_available() and not force_cpu
-    log.info("Starting Sarvam-1 training pipeline (CUDA=%s) …", use_cuda)
+    print("\n========================================")
+    print(" SARVAM-1 AUTO FINE-TUNER")
+    print("========================================")
 
-    # 1. Dataset loading & formatting
+    # 1. Hardware Detection & Auto-Configuration
+    profile = print_hardware_report()
+    config = get_auto_config(
+        profile=profile,
+        epochs=1 if debug else epochs,
+        user_batch_size=batch_size,
+        user_grad_accum=gradient_accumulation_steps,
+        user_seq_length=seq_length,
+        user_lr=learning_rate,
+        user_lora_r=lora_r,
+        user_grad_checkpointing=gradient_checkpointing,
+        force_cpu=force_cpu,
+    )
+    config.print_config()
+
+    # 2. Memory Validation Dry Run (if CUDA & not skipped)
+    if profile.gpu_available and not force_cpu and not skip_dry_run:
+        config = dry_run_memory_check(config, model_name=model_name)
+
+    print("========================================")
+    print(" STARTING TRAINING")
+    print("========================================\n")
+
+    # 3. Load & Format Dataset
+    log.info("Loading MahaSent dataset from '%s' …", data_dir or "default location")
     raw_ds = load_raw_dataset(debug=debug, data_dir=data_dir)
     formatted_ds = format_dataset_for_sft(raw_ds)
+
     train_ds = formatted_ds["train"]
     eval_key = "validation" if "validation" in formatted_ds else "test"
     eval_ds = formatted_ds[eval_key]
 
-    log.info("Sample prompt for training:\n%s", train_ds[0]["text"])
+    log.info("Sample formatted prompt:\n%s", train_ds[0]["text"])
 
-    # 2. Tokenizer setup
+    # 4. Tokenizer Setup
     log.info("Loading tokenizer for '%s' …", model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=MODEL_CACHE_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # 3. Model loading with 4-bit Quantization
-    log.info("Loading base causal model '%s' …", model_name)
-    if use_cuda:
+    # 5. Base Model Loading with 4-bit Quantization
+    log.info("Loading base causal model '%s' (quantization=%s) …", model_name, config.quantization)
+    if config.device == "cuda" and config.quantization == "4bit_nf4":
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=config.torch_dtype,
             bnb_4bit_use_double_quant=True,
         )
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=bnb_config,
             device_map="auto",
-            torch_dtype=torch.bfloat16,
+            torch_dtype=config.torch_dtype,
             trust_remote_code=True,
+            cache_dir=MODEL_CACHE_DIR,
         )
         model = prepare_model_for_kbit_training(model)
     else:
-        log.warning("CUDA unavailable or CPU forced: loading in full precision on CPU (slow).")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float32,
+            torch_dtype=config.torch_dtype,
             trust_remote_code=True,
+            cache_dir=MODEL_CACHE_DIR,
         )
 
-    # Synchronize pad token id
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tokenizer.eos_token_id
 
-    # 4. LoRA Config
+    if config.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
+    # 6. LoRA Adapter setup
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=config.target_modules,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -264,98 +302,118 @@ def train_sarvam(
         (trainable_params / total_params) * 100,
     )
 
-    # 5. Training Arguments / SFTConfig
-    num_epochs = 1 if debug else epochs
+    # 7. SFTConfig / TrainingArguments setup
     config_cls = SFTConfig if SFTConfig is not None else TrainingArguments
     config_kwargs = {
         "output_dir": output_dir,
-        "per_device_train_batch_size": batch_size,
-        "per_device_eval_batch_size": batch_size,
-        "gradient_accumulation_steps": gradient_accumulation_steps,
-        "learning_rate": learning_rate,
-        "num_train_epochs": num_epochs,
-        "lr_scheduler_type": "cosine",
-        "bf16": use_cuda,
-        "fp16": False,
-        "optim": "paged_adamw_8bit" if use_cuda else "adamw_torch",
-        "eval_strategy": "epoch",
-        "save_strategy": "epoch",
+        "per_device_train_batch_size": config.batch_size,
+        "per_device_eval_batch_size": config.batch_size,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "learning_rate": config.learning_rate,
+        "num_train_epochs": config.epochs,
+        "lr_scheduler_type": config.lr_scheduler_type,
+        "bf16": (config.compute_dtype_str == "bfloat16"),
+        "fp16": (config.compute_dtype_str == "float16"),
+        "optim": config.optimizer,
+        "eval_strategy": config.eval_strategy,
+        "save_strategy": config.save_strategy,
         "load_best_model_at_end": True,
         "metric_for_best_model": "eval_loss",
         "greater_is_better": False,
-        "save_total_limit": 2,
-        "logging_steps": 5 if debug else 50,
-        "warmup_steps": 5 if debug else 100,
+        "save_total_limit": config.save_total_limit,
+        "logging_steps": 5 if debug else 20,
+        "warmup_steps": 5 if debug else config.warmup_steps,
         "report_to": "none",
         "seed": 42,
         "data_seed": 42,
-        "dataloader_num_workers": 0,
+        "dataloader_num_workers": config.dataloader_num_workers,
     }
     if SFTConfig is not None:
         config_kwargs["dataset_text_field"] = "text"
-        config_kwargs["max_length"] = 256
+        config_kwargs["max_length"] = config.max_seq_length
 
     training_args = config_cls(**config_kwargs)
 
-    # 6. SFTTrainer
+    # 8. Instantiate SFTTrainer
     trainer_kwargs = {
         "model": model,
         "train_dataset": train_ds,
         "eval_dataset": eval_ds,
         "args": training_args,
+        "callbacks": [EpochSaverCallback(output_dir)],
     }
     if SFTConfig is not None:
         trainer_kwargs["processing_class"] = tokenizer
     else:
         trainer_kwargs["dataset_text_field"] = "text"
-        trainer_kwargs["max_seq_length"] = 256
+        trainer_kwargs["max_seq_length"] = config.max_seq_length
         trainer_kwargs["tokenizer"] = tokenizer
 
     trainer = SFTTrainer(**trainer_kwargs)
 
-    # 7. Train
-    log.info("Starting SFT training for %d epochs …", num_epochs)
+    # 9. Train Model
+    t_start = time.time()
+    log.info("Starting SFT training for %d epoch(s) …", config.epochs)
     train_result = trainer.train()
+    train_duration = time.time() - t_start
 
-    # 8. Save best LoRA adapter & tokenizer
-    log.info("Saving best LoRA adapter to '%s' …", output_dir)
+    # 10. Save Best LoRA Adapter & Tokenizer
+    log.info("Saving best fine-tuned LoRA adapter to '%s' …", output_dir)
     trainer.model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
-    # 9. Evaluate
-    log.info("Running evaluation on '%s' split …", eval_key)
+    # 11. Run Final Validation
+    log.info("Evaluating best checkpoint on validation set ('%s') …", eval_key)
     eval_metrics = trainer.evaluate()
-    log.info("Evaluation metrics: %s", eval_metrics)
+    log.info("Validation Loss: %.4f", eval_metrics.get("eval_loss", 0.0))
 
-    # 10. Save summary & loss curve
-    summary = {**train_result.metrics, **eval_metrics}
+    # 12. Save Summary & Loss Plot
+    summary = {
+        "gpu_name": profile.gpu_name,
+        "vram_gb": profile.total_vram_gb,
+        "epochs": config.epochs,
+        "batch_size": config.batch_size,
+        "grad_accum": config.gradient_accumulation_steps,
+        "effective_batch": config.effective_batch_size,
+        "seq_length": config.max_seq_length,
+        "lora_r": config.lora_r,
+        "train_time_sec": round(train_duration, 2),
+        "peak_vram_gb": config.peak_vram_gb,
+        **train_result.metrics,
+        **eval_metrics,
+    }
     summary_csv = RESULTS_DIR / "sarvam-1_train_metrics.csv"
     pd.DataFrame([summary]).to_csv(summary_csv, index=False)
-    log.info("Saved training metrics → %s", summary_csv)
+    log.info("Saved training summary → %s", summary_csv)
 
     loss_plot_path = RESULTS_DIR / "sarvam-1_loss_curves.png"
     plot_loss_curves(trainer.state.log_history, loss_plot_path, model_tag="sarvam-1")
 
-    log.info("Sarvam-1 fine-tuning completed successfully!")
+    print("\n========================================")
+    print(" TRAINING COMPLETE")
+    print(f" Saved Model : {output_dir}")
+    print(f" Saved Metrics: {summary_csv}")
+    print(f" Loss Plot    : {loss_plot_path}")
+    print("========================================\n")
 
-
-# ---------------------------------------------------------------------------
-# CLI Entry Point
-# ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fine-tune sarvamai/sarvam-1 on Marathi sentiment with 4-bit QLoRA."
+        description="Hardware-adaptive QLoRA fine-tuning for Sarvam-1."
     )
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help=f"Base model (default: {DEFAULT_MODEL})")
-    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR, help=f"LoRA save dir (default: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR, help=f"Adapter save dir (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--data_dir", type=str, default=None, help="Local CSV data directory")
-    parser.add_argument("--debug", action="store_true", help="Quick 99-row sanity check")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of epochs (default: 3)")
-    parser.add_argument("--batch_size", type=int, default=2, help="Per-device batch size (default: 2)")
-    parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps (default: 4)")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (default: 2e-4)")
+    parser.add_argument("--debug", action="store_true", help="Quick 99-row sanity run")
+    parser.add_argument("--epochs", type=int, default=4, help="Number of training epochs (default: 4)")
+    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=None, help="Override batch size")
+    parser.add_argument("--grad-accum", "--grad_accum", dest="grad_accum", type=int, default=None, help="Override gradient accumulation steps")
+    parser.add_argument("--seq-length", "--seq_length", dest="seq_length", type=int, default=None, help="Override max sequence length")
+    parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--lora-r", "--lora_r", dest="lora_r", type=int, default=None, help="Override LoRA rank")
+    parser.add_argument("--grad-checkpointing", dest="grad_checkpointing", action="store_true", default=None, help="Force enable gradient checkpointing")
     parser.add_argument("--cpu", action="store_true", help="Force CPU mode")
+    parser.add_argument("--no-dry-run", action="store_true", help="Skip memory dry-run check")
     return parser.parse_args()
 
 
@@ -369,6 +427,10 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
+        seq_length=args.seq_length,
         learning_rate=args.lr,
+        lora_r=args.lora_r,
+        gradient_checkpointing=args.grad_checkpointing,
         force_cpu=args.cpu,
+        skip_dry_run=args.no_dry_run,
     )

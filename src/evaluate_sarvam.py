@@ -1,34 +1,28 @@
 """
 evaluate_sarvam.py
 ==================
-Evaluation and benchmarking script for the fine-tuned `sarvamai/sarvam-1` (2B)
-Generative Small Language Model (SLM) on the MahaSent-MD test set.
+Evaluation and benchmarking script for `sarvamai/sarvam-1` (2B) on MahaSent test set.
 
 Key Features:
-- Loads base Sarvam-1 model and attaches the fine-tuned LoRA adapter from `saved_models/sarvam-1-lora/`
-- Performs causal generation with prompt prefix slicing to isolate generated prediction tokens
-- Robust response parsing into categorical classes: [Negative, Neutral, Positive]
-- Computes Macro F1, Precision, Recall, Accuracy, and per-sample latency
-- Saves benchmark outputs to `results/`:
-  - `results/sarvam-1_eval_summary.csv`
-  - `results/sarvam-1_per_class_metrics.csv`
-  - `results/sarvam-1_confusion_matrix.png`
-
-Usage:
-------
-# Full evaluation on GPU
-python src/evaluate_sarvam.py --data_dir data/
-
-# Fast debug test (99 samples)
-python src/evaluate_sarvam.py --data_dir data/ --debug
+- Evaluates test set (MahaSent_All_Test.csv) exclusively for benchmarking
+- Supports evaluating both Base Sarvam-1 (zero-shot) and Fine-tuned Sarvam-1 (LoRA)
+- Prints a side-by-side performance comparison table (Original vs Fine-tuned)
+- Computes Accuracy, Precision, Recall, Macro-F1, and per-sample latency
+- Saves outputs to results/:
+  - sarvam-1_eval_summary.csv
+  - sarvam-1_comparison.csv
+  - sarvam-1_per_class_metrics.csv
+  - sarvam-1_confusion_matrix.png
 """
 
 import argparse
 import logging
+import os
 import re
 import sys
 import time
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -45,9 +39,11 @@ from sklearn.metrics import (
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-# Make src/ importable when called from project root
+# Make src/ importable
 sys.path.insert(0, str(Path(__file__).parent))
+from auto_config import get_auto_config
 from data_loader import LABEL_COLUMN, LABEL_NAMES, TEXT_COLUMN, load_raw_dataset
+from gpu_detector import print_hardware_report
 
 try:
     from peft import PeftModel
@@ -61,13 +57,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 DEFAULT_BASE_MODEL: str = "sarvamai/sarvam-1"
 DEFAULT_ADAPTER_DIR: str = "saved_models/sarvam-1-lora"
 RESULTS_DIR: Path = Path("results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_CACHE_DIR: str = str(Path(__file__).parent.parent / "model")
+os.environ["HF_HOME"] = MODEL_CACHE_DIR
+os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE_DIR
 
 PROMPT_TEMPLATE: str = (
     "Classify the sentiment of the following Marathi text. Reply with ONLY ONE WORD from [Positive, Negative, Neutral].\n"
@@ -75,8 +72,6 @@ PROMPT_TEMPLATE: str = (
     "Sentiment:"
 )
 
-# Label index to Name mapping
-# 0 -> negative, 1 -> neutral, 2 -> positive
 CLASS_INDEX_MAP = {
     0: "negative",
     1: "neutral",
@@ -84,30 +79,19 @@ CLASS_INDEX_MAP = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Response Parsing
-# ---------------------------------------------------------------------------
-
 def parse_generated_sentiment(text: str) -> tuple[int, str]:
-    """
-    Parse the raw generated output into a class index (0, 1, 2) and name.
-    
-    Returns:
-        (class_idx, class_name)
-    """
+    """Parse raw generation into label index (0, 1, 2) and class name."""
     cleaned = text.strip().lower()
-    # Match words or prefixes
     tokens = re.findall(r"\b\w+\b", cleaned)
     first_token = tokens[0] if tokens else cleaned
 
     if "pos" in first_token or "आवड" in cleaned or "chan" in cleaned:
         return 2, "positive"
-    elif "neg" in first_token or "वाईट" in cleaned or "रूट" in cleaned or "bakwaas" in cleaned:
+    elif "neg" in first_token or "वाईट" in cleaned or "bakwaas" in cleaned:
         return 0, "negative"
     elif "neu" in first_token or "मध्य" in cleaned or "thik" in cleaned:
         return 1, "neutral"
 
-    # Fallback to substring scanning across full cleaned output
     if "positive" in cleaned:
         return 2, "positive"
     if "negative" in cleaned:
@@ -115,66 +99,60 @@ def parse_generated_sentiment(text: str) -> tuple[int, str]:
     if "neutral" in cleaned:
         return 1, "neutral"
 
-    # Default neutral fallback if model outputs ambiguous token
     return 1, "neutral"
 
 
-# ---------------------------------------------------------------------------
-# Model Loader
-# ---------------------------------------------------------------------------
-
-def load_sarvam_model(
+def load_model_and_tokenizer(
     base_model_name: str = DEFAULT_BASE_MODEL,
-    adapter_dir: str = DEFAULT_ADAPTER_DIR,
+    adapter_dir: Optional[str] = None,
     force_cpu: bool = False,
 ):
-    """Load base model and attach LoRA adapter if present."""
+    """Load base model with optional attached LoRA adapter."""
     use_cuda = torch.cuda.is_available() and not force_cpu
     log.info("Loading tokenizer for '%s' …", base_model_name)
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True, cache_dir=MODEL_CACHE_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    log.info("Loading base model '%s' (CUDA=%s) …", base_model_name, use_cuda)
+    log.info("Loading model '%s' (CUDA=%s) …", base_model_name, use_cuda)
     if use_cuda:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
             bnb_4bit_use_double_quant=True,
         )
         model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
             quantization_config=bnb_config,
             device_map="auto",
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
             trust_remote_code=True,
+            cache_dir=MODEL_CACHE_DIR,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
             torch_dtype=torch.float32,
             trust_remote_code=True,
+            cache_dir=MODEL_CACHE_DIR,
         )
 
-    adapter_path = Path(adapter_dir)
-    if adapter_path.exists() and (adapter_path / "adapter_config.json").exists():
-        if PeftModel is None:
-            log.warning("peft library not installed — unable to load LoRA adapter.")
+    if adapter_dir:
+        adapter_path = Path(adapter_dir)
+        if adapter_path.exists() and (adapter_path / "adapter_config.json").exists():
+            if PeftModel is None:
+                log.warning("peft not installed — unable to load LoRA adapter.")
+            else:
+                log.info("Attaching LoRA adapter from '%s' …", adapter_path)
+                model = PeftModel.from_pretrained(model, str(adapter_path))
         else:
-            log.info("Attaching LoRA adapter from '%s' …", adapter_path)
-            model = PeftModel.from_pretrained(model, str(adapter_path))
-    else:
-        log.warning("Adapter directory '%s' not found. Evaluating base model in zero-shot mode.", adapter_dir)
+            log.warning("Adapter directory '%s' not found. Evaluating in base mode.", adapter_dir)
 
     model.eval()
     return model, tokenizer
 
-
-# ---------------------------------------------------------------------------
-# Confusion Matrix Plot
-# ---------------------------------------------------------------------------
 
 def plot_confusion_matrix(
     y_true: np.ndarray,
@@ -228,40 +206,15 @@ def plot_confusion_matrix(
     log.info("Confusion matrix plot saved → %s", output_path)
 
 
-# ---------------------------------------------------------------------------
-# Evaluation Pipeline
-# ---------------------------------------------------------------------------
-
-def evaluate_sarvam(
-    base_model_name: str = DEFAULT_BASE_MODEL,
-    adapter_dir: str = DEFAULT_ADAPTER_DIR,
-    data_dir: str = None,
-    debug: bool = False,
-    force_cpu: bool = False,
+def run_evaluation_for_model(
+    model,
+    tokenizer,
+    texts: list[str],
+    y_true: np.ndarray,
     batch_size: int = 4,
-) -> dict:
-    """Run full evaluation and save reports to results/."""
-    # 1. Load test data
-    raw_ds = load_raw_dataset(debug=debug, data_dir=data_dir)
-    test_key = "test" if "test" in raw_ds else "validation"
-    test_ds = raw_ds[test_key]
-
-    texts = test_ds[TEXT_COLUMN]
-    raw_labels = test_ds[LABEL_COLUMN]
-    y_true = np.array(raw_labels, dtype=np.int64)
-
-    log.info("Evaluating on %d samples from '%s' split …", len(texts), test_key)
-
-    # 2. Load model
-    model, tokenizer = load_sarvamModel(
-        base_model_name=base_model_name,
-        adapter_dir=adapter_dir,
-        force_cpu=force_cpu,
-    )
-
-    device = "cuda" if (torch.cuda.is_available() and not force_cpu) else "cpu"
-
-    # 3. Batch generation & output slicing
+    device: str = "cuda",
+) -> Tuple[Dict[str, float], np.ndarray]:
+    """Run generation and calculate evaluation metrics for a loaded model."""
     all_preds = []
     total_time = 0.0
 
@@ -292,75 +245,128 @@ def evaluate_sarvam(
             pred_idx, _ = parse_generated_sentiment(resp_str)
             all_preds.append(pred_idx)
 
-        if (i // batch_size) % 10 == 0:
-            log.info("  %d / %d samples processed", min(i + batch_size, len(texts)), len(texts))
-
     y_pred = np.array(all_preds, dtype=np.int64)
     ms_per_sample = (total_time / len(texts)) * 1000 if texts else 0.0
 
-    # 4. Compute metrics
+    acc = accuracy_score(y_true, y_pred)
     macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
     macro_prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
     macro_rec = recall_score(y_true, y_pred, average="macro", zero_division=0)
-    acc = accuracy_score(y_true, y_pred)
 
-    log.info("=" * 60)
-    log.info("SARVAM-1 EVALUATION RESULTS")
-    log.info("=" * 60)
-    log.info("  Accuracy        : %.4f (%.2f%%)", acc, acc * 100)
-    log.info("  Macro F1        : %.4f", macro_f1)
-    log.info("  Macro Precision : %.4f", macro_prec)
-    log.info("  Macro Recall    : %.4f", macro_rec)
-    log.info("  Inference Latency: %.2f ms / sample", ms_per_sample)
-    log.info("-" * 60)
-    log.info(
-        "\n%s",
-        classification_report(y_true, y_pred, target_names=LABEL_NAMES, zero_division=0),
-    )
-
-    # 5. Save outputs
-    summary = {
-        "macro_f1": round(float(macro_f1), 4),
-        "macro_precision": round(float(macro_prec), 4),
-        "macro_recall": round(float(macro_rec), 4),
-        "accuracy": round(float(acc), 4),
-        "ms_per_sample": round(float(ms_per_sample), 3),
+    metrics = {
+        "Accuracy": round(float(acc), 4),
+        "Macro-F1": round(float(macro_f1), 4),
+        "Precision": round(float(macro_prec), 4),
+        "Recall": round(float(macro_rec), 4),
+        "Latency_ms": round(float(ms_per_sample), 2),
     }
-    summary_path = RESULTS_DIR / "sarvam-1_eval_summary.csv"
-    pd.DataFrame([summary]).to_csv(summary_path, index=False)
-    log.info("Summary saved → %s", summary_path)
+
+    return metrics, y_pred
+
+
+def evaluate_sarvam(
+    base_model_name: str = DEFAULT_BASE_MODEL,
+    adapter_dir: str = DEFAULT_ADAPTER_DIR,
+    data_dir: Optional[str] = None,
+    debug: bool = False,
+    force_cpu: bool = False,
+    batch_size: int = 4,
+    compare_baseline: bool = True,
+) -> dict:
+    """Run evaluation on MahaSent_All_Test.csv and compare baseline vs fine-tuned."""
+    profile = print_hardware_report()
+    device = "cuda" if (profile.gpu_available and not force_cpu) else "cpu"
+
+    log.info("Loading MahaSent TEST dataset from '%s' …", data_dir or "default location")
+    raw_ds = load_raw_dataset(debug=debug, data_dir=data_dir)
+    test_ds = raw_ds["test"]
+
+    texts = test_ds[TEXT_COLUMN]
+    y_true = np.array(test_ds[LABEL_COLUMN], dtype=np.int64)
+
+    results = {}
+
+    # 1. Evaluate Fine-Tuned Model
+    log.info("--- Evaluating Fine-Tuned Sarvam-1 (LoRA) ---")
+    model_ft, tokenizer_ft = load_model_and_tokenizer(
+        base_model_name=base_model_name,
+        adapter_dir=adapter_dir,
+        force_cpu=force_cpu,
+    )
+    ft_metrics, ft_preds = run_evaluation_for_model(
+        model_ft, tokenizer_ft, texts, y_true, batch_size=batch_size, device=device
+    )
+    results["Fine-tuned"] = ft_metrics
+
+    # Cleanup fine-tuned model from memory
+    del model_ft, tokenizer_ft
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 2. Evaluate Baseline Model (Zero-shot base model)
+    if compare_baseline:
+        log.info("--- Evaluating Base Sarvam-1 (Zero-shot Original) ---")
+        model_base, tokenizer_base = load_model_and_tokenizer(
+            base_model_name=base_model_name,
+            adapter_dir=None,
+            force_cpu=force_cpu,
+        )
+        base_metrics, base_preds = run_evaluation_for_model(
+            model_base, tokenizer_base, texts, y_true, batch_size=batch_size, device=device
+        )
+        results["Original"] = base_metrics
+
+        del model_base, tokenizer_base
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # 3. Print Side-by-Side Comparison Table
+    print("\n==================================================")
+    print(" BASELINE VS FINE-TUNED MODEL COMPARISON")
+    print("==================================================")
+    if compare_baseline:
+        print(f"{'Metric':<18} {'Original':<15} {'Fine-tuned':<15}")
+        print("-" * 50)
+        for metric_name in ["Accuracy", "Macro-F1", "Precision", "Recall"]:
+            orig_val = results["Original"][metric_name]
+            ft_val = results["Fine-tuned"][metric_name]
+            print(f"{metric_name:<18} {orig_val:<15} {ft_val:<15}")
+    else:
+        print(f"{'Metric':<18} {'Fine-tuned':<15}")
+        print("-" * 35)
+        for metric_name in ["Accuracy", "Macro-F1", "Precision", "Recall"]:
+            ft_val = results["Fine-tuned"][metric_name]
+            print(f"{metric_name:<18} {ft_val:<15}")
+    print("==================================================\n")
+
+    # 4. Save Outputs & Plots
+    comp_df = pd.DataFrame(results)
+    comp_path = RESULTS_DIR / "sarvam-1_comparison.csv"
+    comp_df.to_csv(comp_path)
+    log.info("Saved baseline comparison → %s", comp_path)
+
+    cm_path = RESULTS_DIR / "sarvam-1_confusion_matrix.png"
+    plot_confusion_matrix(y_true, ft_preds, LABEL_NAMES, cm_path, title="Sarvam-1 (QLoRA Fine-tuned)")
 
     report_dict = classification_report(
-        y_true, y_pred, target_names=LABEL_NAMES, zero_division=0, output_dict=True
+        y_true, ft_preds, target_names=LABEL_NAMES, zero_division=0, output_dict=True
     )
     per_class_path = RESULTS_DIR / "sarvam-1_per_class_metrics.csv"
     pd.DataFrame(report_dict).transpose().to_csv(per_class_path)
-    log.info("Per-class metrics saved → %s", per_class_path)
+    log.info("Saved per-class metrics → %s", per_class_path)
 
-    cm_path = RESULTS_DIR / "sarvam-1_confusion_matrix.png"
-    plot_confusion_matrix(y_true, y_pred, LABEL_NAMES, cm_path, title="sarvamai--sarvam-1-lora")
+    return results
 
-    return summary
-
-
-# ---------------------------------------------------------------------------
-# Helper function name alias for backwards compatibility
-# ---------------------------------------------------------------------------
-load_sarvamModel = load_sarvam_model
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate fine-tuned Sarvam-1 on Marathi sentiment.")
+    parser = argparse.ArgumentParser(description="Evaluate Sarvam-1 on MahaSent test set.")
     parser.add_argument("--base_model", type=str, default=DEFAULT_BASE_MODEL, help=f"Base model name (default: {DEFAULT_BASE_MODEL})")
-    parser.add_argument("--adapter_dir", type=str, default=DEFAULT_ADAPTER_DIR, help=f"LoRA adapter path (default: {DEFAULT_ADAPTER_DIR})")
+    parser.add_argument("--adapter_dir", type=str, default=DEFAULT_ADAPTER_DIR, help=f"Adapter path (default: {DEFAULT_ADAPTER_DIR})")
     parser.add_argument("--data_dir", type=str, default=None, help="Local CSV data directory")
     parser.add_argument("--debug", action="store_true", help="Evaluate on 99-sample debug subset")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
-    parser.add_argument("--batch_size", type=int, default=4, help="Inference batch size")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU evaluation")
+    parser.add_argument("--batch_size", type=int, default=4, help="Evaluation batch size")
+    parser.add_argument("--skip-baseline", action="store_true", help="Skip evaluating original base model")
     return parser.parse_args()
 
 
@@ -373,4 +379,5 @@ if __name__ == "__main__":
         debug=args.debug,
         force_cpu=args.cpu,
         batch_size=args.batch_size,
+        compare_baseline=not args.skip_baseline,
     )

@@ -1,2 +1,2 @@
-train_runtime,train_samples_per_second,train_steps_per_second,total_flos,train_loss,epoch,eval_loss,eval_runtime,eval_samples_per_second,eval_steps_per_second,eval_entropy,eval_num_tokens,eval_mean_token_accuracy
-6499.655,7.403,0.925,7.411207873676083e+16,1.1886104482268653,1.0,1.0996869802474976,191.7179,31.296,3.912,1.1059834030469258,3436506.0,0.7993250555992126
+gpu_name,vram_gb,epochs,batch_size,grad_accum,effective_batch,seq_length,lora_r,train_time_sec,peak_vram_gb,train_runtime,train_samples_per_second,train_steps_per_second,total_flos,train_loss,epoch,eval_loss,eval_runtime,eval_samples_per_second,eval_steps_per_second,eval_entropy,eval_num_tokens,eval_mean_token_accuracy
+NVIDIA GeForce RTX 3050 6GB Laptop GPU,6.0,1,1,16,16,512,8,57.91,6.22,57.6168,1.718,0.121,98743253925888.0,3.04793609891619,1.0,2.4414665699005127,11.7635,8.416,8.416,2.404756768785342,6864.0,0.5541334477337924

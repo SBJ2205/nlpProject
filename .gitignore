@@ -14,6 +14,7 @@ venv.bak/
 # Model checkpoints & outputs (large binaries)
 outputs/
 saved_models/
+model/
 runs/
 checkpoints/
 *.pt
@@ -24,6 +25,7 @@ checkpoints/
 
 # Data directory (large CSVs / raw datasets)
 data/
+dataset/
 *.csv
 !results/**/*.csv
 

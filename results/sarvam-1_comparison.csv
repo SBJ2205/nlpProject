@@ -1,0 +1,6 @@
+,Fine-tuned,Original
+Accuracy,0.4545,0.3939
+Macro-F1,0.3734,0.2978
+Precision,0.4208,0.4137
+Recall,0.4545,0.3939
+Latency_ms,151.91,87.97

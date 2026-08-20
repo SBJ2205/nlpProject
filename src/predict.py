@@ -2,46 +2,36 @@
 predict.py
 ==========
 Interactive real-time sentiment prediction on custom Marathi / code-mixed text.
-Supports both encoder-based classification models (IndicBERT, MuRIL) and
-generative Small Language Models (Sarvam-1 with LoRA adapters).
-
-Supports two modes:
-  1. Interactive REPL  — type sentences one at a time, get live predictions.
-  2. Batch mode        — pass --text "some sentence" for single prediction,
-                         or --file sentences.txt for bulk prediction.
+Supports both fine-tuned Sarvam-1 SLM (with LoRA adapters) and encoder models.
 
 Usage
 -----
-# Interactive mode with default model
-python src/predict.py --cpu
+# Interactive mode
+python predict.py --interactive
 
-# Single sentence with Sarvam-1 LoRA adapter
-python src/predict.py --model_dir saved_models/sarvam-1-lora --text "हा चित्रपट खूप छान आहे"
-
-# Bulk prediction from a text file
-python src/predict.py --file my_sentences.txt
+# Single sentence prediction
+python predict.py --text "हा चित्रपट खूप छान आहे"
 """
 
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
 from pathlib import Path
 
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
-# Make src/ importable when called from project root
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+# Make src/ importable
 sys.path.insert(0, str(Path(__file__).parent))
 from data_loader import normalize_text
-from train import detect_device
+from gpu_detector import detect_hardware
 
 try:
     from peft import PeftModel
@@ -55,7 +45,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL_DIR: str = "outputs/ai4bharat--indic-bert"
+MODEL_CACHE_DIR: str = str(Path(__file__).parent.parent / "model")
+os.environ["HF_HOME"] = MODEL_CACHE_DIR
+os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE_DIR
+
+DEFAULT_MODEL_DIR: str = "saved_models/sarvam-1-lora"
+DEFAULT_BASE_MODEL: str = "sarvamai/sarvam-1"
 LABEL_NAMES: list[str] = ["negative", "neutral", "positive"]
 LABEL_EMOJI: dict[str, str] = {
     "negative": "[--] Negative",
@@ -71,7 +66,7 @@ PROMPT_TEMPLATE: str = (
 
 
 def parse_generated_sentiment(text: str) -> tuple[int, str]:
-    """Parse raw generation into label index and name."""
+    """Parse raw model generation into label index and string."""
     cleaned = text.strip().lower()
     tokens = re.findall(r"\b\w+\b", cleaned)
     first_token = tokens[0] if tokens else cleaned
@@ -93,178 +88,102 @@ def parse_generated_sentiment(text: str) -> tuple[int, str]:
     return 1, "neutral"
 
 
-# ---------------------------------------------------------------------------
-# Predictor class
-# ---------------------------------------------------------------------------
-
 class SentimentPredictor:
-    """
-    Wraps fine-tuned HuggingFace encoder models or generative SLMs (Sarvam-1)
-    for single- and batch-sentence Marathi sentiment inference.
-    """
+    """Predictor class for Sarvam-1 SLM and QLoRA fine-tuned adapters."""
 
-    def __init__(self, model_dir: str, device: str = "cpu") -> None:
+    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, force_cpu: bool = False) -> None:
+        profile = detect_hardware()
+        use_cuda = profile.gpu_available and not force_cpu
+        self.device = "cuda" if use_cuda else "cpu"
+
         model_path = Path(model_dir).resolve()
-        self.device = device
-        self.is_generative = False
+        base_model_name = DEFAULT_BASE_MODEL
 
-        if not model_path.exists():
-            # Check if it's a HuggingFace hub id
-            model_path_str = model_dir
-        else:
-            model_path_str = str(model_path)
-
-        # Detect whether it is a LoRA adapter or Causal LM
-        is_adapter = (Path(model_path_str) / "adapter_config.json").exists() if Path(model_path_str).exists() else False
-        is_sarvam = "sarvam" in model_path_str.lower()
-
-        if is_adapter or is_sarvam:
-            self.is_generative = True
-            self._init_generative_model(model_path_str, is_adapter)
-        else:
-            self._init_classification_model(model_path_str)
-
-    def _init_classification_model(self, model_path_str: str) -> None:
-        """Initialize encoder-based sequence classification model."""
-        log.info("Loading sequence classification model from '%s' …", model_path_str)
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_path_str, local_files_only=Path(model_path_str).exists()
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path_str, local_files_only=Path(model_path_str).exists()
-        )
-        self.model.to(self.device)
-        self.model.eval()
-
-        n_params = sum(p.numel() for p in self.model.parameters())
-        log.info("Model loaded  — %s parameters (%.1f M)", f"{n_params:,}", n_params / 1e6)
-        log.info("Device        — %s", self.device.upper())
-
-    def _init_generative_model(self, model_path_str: str, is_adapter: bool) -> None:
-        """Initialize generative Causal LM with optional LoRA adapter."""
-        base_model_name = "sarvamai/sarvam-1"
-        if is_adapter:
+        if model_path.exists() and (model_path / "adapter_config.json").exists():
             try:
-                with open(Path(model_path_str) / "adapter_config.json", encoding="utf-8") as f:
+                with open(model_path / "adapter_config.json", encoding="utf-8") as f:
                     cfg = json.load(f)
                     base_model_name = cfg.get("base_model_name_or_path", base_model_name)
             except Exception:
                 pass
+            is_adapter = True
+        else:
+            is_adapter = False
 
-        use_cuda = (self.device == "cuda" or (torch.cuda.is_available() and self.device != "cpu"))
-        log.info("Loading generative tokenizer for '%s' …", base_model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+        log.info("Loading tokenizer for '%s' …", base_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True, cache_dir=MODEL_CACHE_DIR)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        log.info("Loading base causal model '%s' (CUDA=%s) …", base_model_name, use_cuda)
+        log.info("Loading base causal model '%s' (device=%s) …", base_model_name, self.device)
         if use_cuda:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=torch.bfloat16 if profile.bf16_supported else torch.float16,
                 bnb_4bit_use_double_quant=True,
             )
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 quantization_config=bnb_config,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16 if profile.bf16_supported else torch.float16,
                 trust_remote_code=True,
+                cache_dir=MODEL_CACHE_DIR,
             )
         else:
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 torch_dtype=torch.float32,
                 trust_remote_code=True,
+                cache_dir=MODEL_CACHE_DIR,
             )
 
         if is_adapter and PeftModel is not None:
-            log.info("Attaching LoRA adapter from '%s' …", model_path_str)
-            self.model = PeftModel.from_pretrained(base_model, model_path_str)
+            log.info("Attaching LoRA adapter from '%s' …", model_dir)
+            self.model = PeftModel.from_pretrained(base_model, str(model_path))
         else:
             self.model = base_model
 
         self.model.eval()
-        log.info("Generative SLM initialized on device '%s'.", self.device)
+        log.info("Predictor initialized successfully.")
 
     def predict(self, text: str) -> dict:
-        """
-        Predict sentiment for a single text string.
-        """
+        """Predict sentiment for a single text string."""
         normalised = normalize_text(text)
-
-        if self.is_generative:
-            prompt = PROMPT_TEMPLATE.format(text_sample=normalised)
-            inputs = self.tokenizer(prompt, return_tensors="pt")
-            inputs = {k: v.to(self.model.device if hasattr(self.model, "device") else self.device) for k, v in inputs.items()}
-            input_len = inputs["input_ids"].shape[1]
-
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=5,
-                    temperature=0.1,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
-            latency_ms = (time.perf_counter() - t0) * 1000
-
-            new_tokens = outputs[0][input_len:]
-            gen_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-            pred_idx, pred_label = parse_generated_sentiment(gen_text)
-
-            # Heuristic distribution for generative single-token output
-            scores = {name: (0.90 if i == pred_idx else 0.05) for i, name in enumerate(LABEL_NAMES)}
-            confidence = scores[pred_label]
-
-            return {
-                "label": pred_label,
-                "confidence": confidence,
-                "scores": scores,
-                "latency_ms": latency_ms,
-                "input": normalised,
-                "raw_generation": gen_text,
-            }
-
-        # Sequence classification encoder pipeline
-        enc = self.tokenizer(
-            normalised,
-            max_length=128,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        )
-        enc = {k: v.to(self.device) for k, v in enc.items()}
+        prompt = PROMPT_TEMPLATE.format(text_sample=normalised)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        input_len = inputs["input_ids"].shape[1]
 
         t0 = time.perf_counter()
         with torch.no_grad():
-            logits = self.model(**enc).logits
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=5,
+                temperature=0.1,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
         latency_ms = (time.perf_counter() - t0) * 1000
 
-        probs = torch.softmax(logits, dim=-1).squeeze().tolist()
-        if not isinstance(probs, list):
-            probs = [probs]
+        new_tokens = outputs[0][input_len:]
+        gen_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        pred_idx, pred_label = parse_generated_sentiment(gen_text)
 
-        pred_idx = int(torch.argmax(logits, dim=-1).item())
+        scores = {name: (0.90 if i == pred_idx else 0.05) for i, name in enumerate(LABEL_NAMES)}
+        confidence = scores[pred_label]
+
         return {
-            "label": LABEL_NAMES[pred_idx],
-            "confidence": probs[pred_idx],
-            "scores": dict(zip(LABEL_NAMES, probs)),
+            "label": pred_label,
+            "confidence": confidence,
+            "scores": scores,
             "latency_ms": latency_ms,
             "input": normalised,
+            "raw_generation": gen_text,
         }
 
-    def predict_batch(self, texts: list[str]) -> list[dict]:
-        """Run predict() on a list of sentences."""
-        return [self.predict(t) for t in texts]
-
-
-# ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
 
 def _format_result(result: dict) -> str:
     label = result["label"]
@@ -277,35 +196,22 @@ def _format_result(result: dict) -> str:
         f"  Prediction  : {emoji}  ({conf_pct:.1f}% confidence)",
         f"  Confidence  : [{bar}]",
         f"  Latency     : {result['latency_ms']:.1f} ms",
-        "  Scores      :",
+        f"  SLM Output  : '{result['raw_generation']}'",
+        f"  Input text  : {result['input']}",
     ]
-    for cls, prob in result["scores"].items():
-        marker = " <--" if cls == label else ""
-        lines.append(f"    {cls:<10} {prob * 100:>5.1f}%{marker}")
-    if "raw_generation" in result:
-        lines.append(f"  SLM Output  : '{result['raw_generation']}'")
-    lines.append(f"  Input text  : {result['input'][:80]}{'...' if len(result['input']) > 80 else ''}")
     return "\n".join(lines)
 
 
-def _print_header(model_dir: str) -> None:
+def run_interactive(predictor: SentimentPredictor) -> None:
+    """Start interactive REPL."""
     print("\n" + "═" * 58)
-    print("  Marathi Sentiment Predictor")
-    print(f"  Model : {Path(model_dir).name}")
-    print("  Type a sentence and press Enter. Type 'quit' to exit.")
+    print("  Sarvam-1 Marathi Sentiment Predictor")
+    print("  Type Marathi text and press Enter. Type 'quit' to exit.")
     print("═" * 58)
 
-
-# ---------------------------------------------------------------------------
-# Run modes
-# ---------------------------------------------------------------------------
-
-def run_interactive(predictor: SentimentPredictor, model_dir: str) -> None:
-    """Start the interactive REPL loop."""
-    _print_header(model_dir)
     while True:
         try:
-            text = input("\n▶  Enter text: ").strip()
+            text = input("\n▶ Enter Marathi text: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nGoodbye!")
             break
@@ -320,71 +226,21 @@ def run_interactive(predictor: SentimentPredictor, model_dir: str) -> None:
         print(_format_result(result))
 
 
-def run_single(predictor: SentimentPredictor, text: str) -> None:
-    """Predict and print for a single --text argument."""
-    result = predictor.predict(text)
-    print(_format_result(result))
-
-
-def run_file(predictor: SentimentPredictor, filepath: str) -> None:
-    """Predict all sentences in a text file (one per line)."""
-    path = Path(filepath)
-    if not path.exists():
-        log.error("File not found: %s", filepath)
-        sys.exit(1)
-
-    lines = [l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
-    log.info("Running batch prediction on %d sentences from '%s' …", len(lines), filepath)
-    print("\n" + "═" * 58)
-    for i, sentence in enumerate(lines, 1):
-        result = predictor.predict(sentence)
-        print(f"\n[{i}/{len(lines)}]{_format_result(result)}")
-    print("\n" + "═" * 58)
-    log.info("Done.")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Interactive Marathi sentiment predictor for BERT and Sarvam-1 SLM."
-    )
-    parser.add_argument(
-        "--model_dir",
-        type=str,
-        default=DEFAULT_MODEL_DIR,
-        help=f"Saved model directory or LoRA adapter (default: {DEFAULT_MODEL_DIR}).",
-    )
-    parser.add_argument(
-        "--text",
-        type=str,
-        default=None,
-        help="Single sentence to predict (skips interactive mode).",
-    )
-    parser.add_argument(
-        "--file",
-        type=str,
-        default=None,
-        help="Path to a .txt file with one sentence per line for batch prediction.",
-    )
-    parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Force CPU execution.",
-    )
+    parser = argparse.ArgumentParser(description="Sarvam-1 Sentiment Predictor")
+    parser.add_argument("--model_dir", type=str, default=DEFAULT_MODEL_DIR, help="Model or LoRA adapter directory")
+    parser.add_argument("--text", type=str, default=None, help="Single text sentence to predict")
+    parser.add_argument("--interactive", action="store_true", help="Start interactive REPL mode")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    device = detect_device(force_cpu=args.cpu)
-    predictor = SentimentPredictor(model_dir=args.model_dir, device=device)
+    predictor = SentimentPredictor(model_dir=args.model_dir, force_cpu=args.cpu)
 
-    if args.file:
-        run_file(predictor, args.file)
-    elif args.text:
-        run_single(predictor, args.text)
+    if args.text:
+        res = predictor.predict(args.text)
+        print(_format_result(res))
     else:
-        run_interactive(predictor, args.model_dir)
+        run_interactive(predictor)

@@ -194,6 +194,13 @@ def load_raw_dataset(
     -------
     DatasetDict  with keys  ``train``, ``validation``, ``test``.
     """
+    if data_dir is None:
+        for candidate in ["dataset", "data"]:
+            cand_path = Path(candidate)
+            if (cand_path / LOCAL_CSV_TRAIN).exists():
+                data_dir = candidate
+                break
+
     if data_dir:
         data_path = Path(data_dir)
         train_csv = data_path / LOCAL_CSV_TRAIN
