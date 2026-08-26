@@ -159,16 +159,16 @@ def get_auto_config(
         torch_dtype = torch.float32
         optimizer = "adamw_torch"
 
-    # 2. VRAM Tiering & Auto Heuristics
-    vram = profile.free_vram_gb if profile.gpu_available else 0.0
+    # 2. VRAM Tiering & Auto Heuristics (using Total VRAM, validated by dry-run)
+    vram = profile.total_vram_gb if profile.gpu_available else 0.0
 
-    if not use_cuda or vram <= 7.0:  # e.g., RTX 3050 (6GB)
+    if not use_cuda or vram <= 6.5:  # e.g., RTX 3050 (6GB)
         auto_batch_size = 1
         auto_grad_accum = 16
         auto_seq_length = 512
         auto_grad_checkpointing = True
         auto_lora_r = 8
-    elif vram <= 13.0:  # e.g., RTX 3060/3070/4060 (8GB - 12GB)
+    elif vram <= 13.0:  # e.g., RTX 5050 / 3060 / 4060 (8GB - 12GB)
         auto_batch_size = 2
         auto_grad_accum = 8
         auto_seq_length = 1024
