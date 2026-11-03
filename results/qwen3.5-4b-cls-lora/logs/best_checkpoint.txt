@@ -1,0 +1,3 @@
+best_step: 0.8183129736105853
+best_val_f1: 0.818313
+best_checkpoint_path: saved_models\qwen3.5-4b-cls-lora\checkpoints\checkpoint-3000

@@ -580,18 +580,67 @@ def run_domain_evaluation(
             f"Run 'python src/train.py --cpu --debug' first to create a checkpoint.{hint}"
         )
 
-    # Check whether model is a LoRA adapter or Causal LM
+    # Check whether model is a LoRA adapter or Causal LM.
+    # Priority: train_meta.json (if present) tells us the model_type.
+    import json as _json
     is_adapter = (model_path / "adapter_config.json").exists() if model_path.exists() else False
-    is_sarvam = "sarvam" in model_dir.lower()
-    is_generative = is_adapter or is_sarvam
+    is_sarvam  = "sarvam" in model_dir.lower()
 
-    if is_generative:
+    # Detect LoRA SEQ_CLS adapter (e.g. Qwen3.5-4B) via train_meta.json
+    _meta_path = model_path / "train_meta.json"
+    _is_lora_cls = False
+    if _meta_path.exists():
+        try:
+            with open(_meta_path, encoding="utf-8") as _f:
+                _meta = _json.load(_f)
+            if _meta.get("model_type") == "LoRA_SEQ_CLS":
+                _is_lora_cls = True
+        except Exception:
+            pass
+
+    is_generative = (is_adapter or is_sarvam) and not _is_lora_cls
+
+    if _is_lora_cls:
+        # ── LoRA + classification head (Qwen3.5-4B or similar SEQ_CLS) ──────
+        log.info("Detected LoRA SEQ_CLS adapter — loading classification model ...")
+        base_model_name = _meta.get("model", "Qwen/Qwen3.5-4B")
+        log.info("Base model: %s", base_model_name)
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path), trust_remote_code=True, use_fast=True
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            base_model_name,
+            num_labels=3,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
+            ignore_mismatched_sizes=True,
+        )
+        if tokenizer.pad_token_id is not None:
+            base_model.config.pad_token_id = tokenizer.pad_token_id
+        if hasattr(base_model.config, "get_text_config"):
+            try:
+                base_model.config.get_text_config().pad_token_id = tokenizer.pad_token_id
+            except Exception:
+                pass
+        if PeftModel is not None:
+            log.info("Attaching LoRA adapter and merging ...")
+            peft_model = PeftModel.from_pretrained(base_model, str(model_path))
+            model = peft_model.merge_and_unload()
+        else:
+            model = base_model
+        model.eval()
+        model.to(device)
+
+    elif is_generative:
         base_model_name = "sarvamai/sarvam-1"
         if is_adapter:
             try:
-                import json
                 with open(model_path / "adapter_config.json", encoding="utf-8") as f:
-                    cfg = json.load(f)
+                    cfg = _json.load(f)
                     base_model_name = cfg.get("base_model_name_or_path", base_model_name)
             except Exception:
                 pass

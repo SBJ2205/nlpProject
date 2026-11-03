@@ -114,15 +114,78 @@ class SentimentPredictor:
         else:
             model_path_str = str(model_path)
 
-        # Detect whether it is a LoRA adapter or Causal LM
+        # Detect whether it is a LoRA adapter, LoRA SEQ_CLS, or Causal LM
         is_adapter = (Path(model_path_str) / "adapter_config.json").exists() if Path(model_path_str).exists() else False
         is_sarvam = "sarvam" in model_path_str.lower()
 
-        if is_adapter or is_sarvam:
+        # Check train_meta.json for LoRA SEQ_CLS (Qwen3.5-4B)
+        _meta_path = Path(model_path_str) / "train_meta.json"
+        _is_lora_cls = False
+        if _meta_path.exists():
+            try:
+                with open(_meta_path, encoding="utf-8") as _mf:
+                    _meta = json.load(_mf)
+                if _meta.get("model_type") == "LoRA_SEQ_CLS":
+                    _is_lora_cls = True
+            except Exception:
+                pass
+
+        if _is_lora_cls:
+            self.is_generative = False
+            self._init_lora_cls_model(model_path_str)
+        elif is_adapter or is_sarvam:
             self.is_generative = True
             self._init_generative_model(model_path_str, is_adapter)
         else:
             self._init_classification_model(model_path_str)
+
+    def _init_lora_cls_model(self, model_path_str: str) -> None:
+        """Initialize LoRA SEQ_CLS model (e.g. Qwen3.5-4B + linear head)."""
+        import json as _json
+        from transformers import AutoModelForSequenceClassification
+        try:
+            from peft import PeftModel as _PeftModel
+        except ImportError:
+            _PeftModel = None
+
+        with open(Path(model_path_str) / "train_meta.json", encoding="utf-8") as _f:
+            _meta = _json.load(_f)
+        base_model_name = _meta.get("model", "Qwen/Qwen3.5-4B")
+
+        log.info("Loading LoRA SEQ_CLS model from '%s' ...", model_path_str)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path_str, trust_remote_code=True, use_fast=True
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
+
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            base_model_name,
+            num_labels=3,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
+            ignore_mismatched_sizes=True,
+        )
+        if self.tokenizer.pad_token_id is not None:
+            base_model.config.pad_token_id = self.tokenizer.pad_token_id
+        if hasattr(base_model.config, "get_text_config"):
+            try:
+                base_model.config.get_text_config().pad_token_id = self.tokenizer.pad_token_id
+            except Exception:
+                pass
+
+        if _PeftModel is not None:
+            peft_model = _PeftModel.from_pretrained(base_model, model_path_str)
+            self.model = peft_model.merge_and_unload()
+        else:
+            self.model = base_model
+
+        self.model.to(self.device)
+        self.model.eval()
+        n_params = sum(p.numel() for p in self.model.parameters())
+        log.info("LoRA SEQ_CLS loaded — %s parameters (%.1f M)", f"{n_params:,}", n_params / 1e6)
 
     def _init_classification_model(self, model_path_str: str) -> None:
         """Initialize encoder-based sequence classification model."""

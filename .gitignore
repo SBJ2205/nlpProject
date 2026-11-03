@@ -25,12 +25,14 @@ checkpoints/
 # Data directory (large CSVs / raw datasets)
 data/
 *.csv
+!results/*.csv
 !results/**/*.csv
 
 # Logs & temp files
 *.log
 .cache/
 wandb/
+patch_*.py
 
 # OS / Editor files
 .vscode/

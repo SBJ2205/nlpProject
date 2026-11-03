@@ -5,42 +5,39 @@
 # ============================================================
 
 # ------------------------------------------------------------------
-# PyTorch — Install CUDA-enabled build FIRST (before this file).
-# Do NOT use `pip install torch` from this file for CUDA support.
-#
-# For CUDA 12.x (RTX 5060 / Blackwell arch, PyTorch >= 2.4):
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# PyTorch — CUDA 12.4 build (NVIDIA RTX 4090 / Ampere / Ada Lovelace):
+#   pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
 #
 # Verify GPU is visible after install:
 #   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 # ------------------------------------------------------------------
 
-# Core ML / NLP
-transformers>=4.40.0
-datasets>=2.18.0
-evaluate>=0.4.1
-accelerate>=0.29.0          # Required by Hugging Face Trainer for mixed-precision
-tokenizers>=0.19.0
-peft>=0.10.0                # Parameter-Efficient Fine-Tuning (QLoRA)
-bitsandbytes>=0.43.0        # 4-bit / 8-bit quantization
-trl>=0.8.6                  # SFTTrainer for causal language models
+# Core ML / NLP (pinned to verified latest versions)
+transformers==5.20.2
+datasets==5.1.0
+evaluate==0.4.6
+accelerate==1.15.0
+tokenizers==0.23.3
+peft==0.21.2
+bitsandbytes==0.50.2
+trl==1.14.2
 
 # Classical ML baseline
-scikit-learn>=1.4.2
-scipy>=1.13.0
+scikit-learn==1.7.2
+scipy==1.15.3
 
 # Data handling
-pandas>=2.2.2
-numpy>=1.26.4
+pandas==2.3.3
+numpy==2.2.6
 
 # Visualisation
-matplotlib>=3.8.4
-seaborn>=0.13.2
+matplotlib==3.10.9
+seaborn==0.13.2
 
 # Utilities
-tqdm>=4.66.2
-sentencepiece>=0.2.0        # Required by indic-bert / MuRIL tokenisers
-protobuf>=4.25.3            # Required by sentencepiece
-huggingface-hub>=0.22.2
+tqdm==4.70.1
+sentencepiece==0.2.2
+protobuf==7.36.2
+huggingface-hub==2.4.0
 
-streamlit>=1.35.0
+streamlit==1.65.0

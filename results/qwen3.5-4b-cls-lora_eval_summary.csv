@@ -1,0 +1,2 @@
+macro_f1,macro_precision,macro_recall,accuracy,latency_ms_sample,latency_ms_batch1
+0.813836,0.813942,0.814222,0.814222,10.215,79.157
